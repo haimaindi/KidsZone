@@ -39,7 +39,8 @@ import {
   Tags,
   SpellCheck,
   Play,
-  Camera
+  Camera,
+  Square
 } from 'lucide-react';
 
 // --- Konfigurasi AI ---
@@ -122,7 +123,20 @@ const pcmToWav = (pcmData, sampleRate) => {
   return new Blob([buffer], { type: 'audio/wav' });
 };
 
-// --- Sub-Components ---
+const fetchWithRetry = async (url, options, retries = 5, backoff = 1000) => {
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `HTTP error! status: ${response.status}`);
+    return data;
+  } catch (error) {
+    if (retries > 0) {
+      await new Promise(resolve => setTimeout(resolve, backoff));
+      return fetchWithRetry(url, options, retries - 1, backoff * 2);
+    }
+    throw error;
+  }
+};
 
 const MenuCard = ({ onClick, icon, title, desc, color }) => {
   const colors = {
@@ -169,9 +183,12 @@ const App = () => {
   const [modalType, setModalType] = useState(null); 
   const [error, setError] = useState(null);
 
+  // --- Global State for Audio Prefetch ---
+  const [audioCache, setAudioCache] = useState({}); // { [key]: blobUrl }
+
   // --- Magic Sketch State ---
-  const [sketchStep, setSketchStep] = useState('setup');
-  const [orientation, setOrientation] = useState('landscape');
+  const [sketchStep, setSketchStep] = useState('draw'); 
+  const [orientation, setOrientation] = useState('landscape'); 
   const [activeTool, setActiveTool] = useState('pencil');
   const [activeColor, setActiveColor] = useState('#FF595E');
   const [brushSize, setBrushSize] = useState(10);
@@ -226,6 +243,55 @@ const App = () => {
   const canvasRef = useRef(null);
   const contextRef = useRef(null);
   const isDrawing = useRef(false);
+  const currentAudioRef = useRef(null);
+
+  // --- Universal Audio Handlers ---
+  const stopCurrentAudio = () => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    setIsSpeaking(false);
+  };
+
+  const getTTSBlob = async (text, langCode = 'id') => {
+    const speakerVoice = langCode === 'id' ? 'Kore' : 'Zephyr';
+    const emotionPrefix = langCode === 'id' ? 'Katakan dengan ceria: ' : 'Say cheerfully: ';
+    try {
+      const data = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: emotionPrefix + text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: speakerVoice } } } } })
+      });
+      const pcmBase64 = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const sampleRate = parseInt(data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType.split('rate=')[1] || "24000");
+      if (pcmBase64) {
+        const binaryString = window.atob(pcmBase64);
+        const pcmData = new Int16Array(binaryString.length / 2);
+        for (let i = 0; i < pcmData.length; i++) { pcmData[i] = binaryString.charCodeAt(i * 2) | (binaryString.charCodeAt(i * 2 + 1) << 8); }
+        const wavBlob = pcmToWav(pcmData, sampleRate);
+        return URL.createObjectURL(wavBlob);
+      }
+    } catch (err) { console.error("TTS generation error", err); }
+    return null;
+  };
+
+  const playAudio = async (text, idKey, langCode = 'id') => {
+    if (isSpeaking) { stopCurrentAudio(); return; }
+    
+    let audioUrl = audioCache[idKey];
+    if (!audioUrl) {
+      audioUrl = await getTTSBlob(text, langCode);
+      if (audioUrl) setAudioCache(prev => ({ ...prev, [idKey]: audioUrl }));
+    }
+
+    if (audioUrl) {
+      const audio = new Audio(audioUrl);
+      currentAudioRef.current = audio;
+      setIsSpeaking(true);
+      audio.onended = () => setIsSpeaking(false);
+      audio.play();
+    }
+  };
 
   // --- Handlers & Helpers ---
   const handleDownloadSimple = (imageUrl, fileName = "kidszone_artwork.png") => {
@@ -270,12 +336,19 @@ const App = () => {
     const img = new Image(); img.crossOrigin = "anonymous"; img.src = imageUrl;
     img.onload = () => {
       const canvas = document.createElement('canvas'); canvas.width = 1200; canvas.height = 1600;
-      const ctx = canvas.getContext('2d'); ctx.fillStyle = "white"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-      const imgRatio = img.width / img.height; const canvasRatio = 1200 / 1600;
+      const ctx = canvas.getContext('2d');
+      const targetRatio = 1200 / 1600;
+      const imgRatio = img.width / img.height;
       let dWidth, dHeight, dx, dy;
-      if (imgRatio > canvasRatio) { dWidth = 1200; dHeight = 1200 / imgRatio; } 
-      else { dHeight = 1600; dWidth = 1600 * imgRatio; }
-      dx = (1200 - dWidth) / 2; dy = (1600 - dHeight) / 2;
+      if (imgRatio > targetRatio) { 
+        dHeight = 1600; dWidth = 1600 * imgRatio;
+        dx = (1200 - dWidth) / 2; dy = 0;
+      } else { 
+        dWidth = 1200; dHeight = 1200 / imgRatio;
+        dx = 0; dy = (1600 - dHeight) / 2;
+      }
+      ctx.fillStyle = "white";
+      ctx.fillRect(0, 0, 1200, 1600);
       ctx.drawImage(img, dx, dy, dWidth, dHeight);
       const link = document.createElement('a'); link.download = `${prefix}_${idx + 1}.png`; link.href = canvas.toDataURL("image/png"); link.click();
     };
@@ -342,36 +415,36 @@ const App = () => {
     if (!storyIdea.trim()) return;
     setIsProcessingStory(true); setStoryPages([]); setError(null);
     try {
-      const targetLang = storyLanguage === 'id' ? 'Indonesian' : 'English';
-      const initialPrompt = `Act as a Storyboard Director and Identity Analyst. Create a kid-friendly story: "${storyIdea}". ${storyPhoto ? "Carefully analyze the child in the attached photo. Extract their key facial features, hair style, and personality vibe into a 'Master Identity Profile'. " : ""}Break the story into EXACTLY 12 sequential storyboards. For each storyboard, provide storyText and imagePrompt. Respond ONLY as valid JSON object.`;
+      const initialPrompt = `Act as a Storyboard Director. Create a kid-friendly story: "${storyIdea}". ${storyPhoto ? "Protagonist looks like the child in photo. " : ""}Break story into EXACTLY 12 stories. Provide storyText and imagePrompt as JSON: { "scenes": [{ "storyText": "...", "imagePrompt": "..." }] }. Language: ${storyLanguage === 'id' ? 'Indonesian' : 'English'}.`;
       const initialContents = [{ parts: [{ text: initialPrompt }] }];
       if (storyPhoto) initialContents[0].parts.push({ inlineData: { mimeType: "image/png", data: storyPhoto.split(',')[1] } });
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      
+      const data = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: initialContents, generationConfig: { responseMimeType: "application/json" } })
       });
-      const data = await response.json();
+      
       const storyboardData = JSON.parse(data.candidates[0].content.parts[0].text);
-      const generatedPages = []; let lastImageBase64 = null; 
+      const generatedPages = [];
       for (let i = 0; i < storyboardData.scenes.length; i++) {
         const page = storyboardData.scenes[i];
-        const baseStyle = "High-fidelity vibrant 3D Disney Pixar movie style animation. Professional lighting. ";
-        const mappingInstruction = storyPhoto ? `MANDATORY: The protagonist MUST look EXACTLY like the child in the attached reference photo. ` : `Maintain character consistency. `;
-        const contextInstruction = `Scene ${i+1}: ${page.imagePrompt}. NO TEXT in image. 16:9 widescreen.`;
-        const imgParts = [{ text: `${baseStyle} ${mappingInstruction} ${contextInstruction}` }];
+        const imgParts = [{ text: `Vibrant 3D Pixar style. Scene ${i+1}: ${page.imagePrompt}. NO TEXT in image. 16:9 widescreen.` }];
         if (storyPhoto) imgParts.push({ inlineData: { mimeType: "image/png", data: storyPhoto.split(',')[1] } });
-        if (lastImageBase64) imgParts.push({ inlineData: { mimeType: "image/png", data: lastImageBase64 } });
-        const imgRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+        
+        const imgData = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ parts: imgParts }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
         });
-        const imgData = await imgRes.json();
+        
         const rawBase64 = imgData.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
         if (rawBase64) {
-          lastImageBase64 = rawBase64; 
           const comp = await compositeTextOnImage(`data:image/png;base64,${rawBase64}`, page.storyText, i + 1);
-          generatedPages.push({ image: comp, text: page.storyText });
+          generatedPages.push({ image: comp, text: page.storyText, audioKey: `story_${i}` });
           setStoryPages([...generatedPages]);
+          // Prefetch audio for this page
+          getTTSBlob(page.storyText, storyLanguage).then(url => {
+            if (url) setAudioCache(prev => ({ ...prev, [`story_${i}`]: url }));
+          });
         }
       }
     } catch (err) { setError("Ups! Sihir cerita macet."); }
@@ -382,210 +455,162 @@ const App = () => {
     const subject = customPrintable.trim() || printableSubject;
     setIsProcessingPrintable(true); setPrintableResults([]); setError(null);
     try {
-      const finalPrompt = `Professional bold black and white line art, coloring book page for kids, thick clear outlines, no shading, no colors, pure white background, landscape 16:9 aspect ratio, high resolution, ultra clean lines. Subject: ${subject}. Clear boundaries for coloring.`;
+      const finalPrompt = `Professional bold black and white line art coloring book page for kids. Subject: ${subject}. Clear thick outlines, no colors, pure white background, landscape 16:9.`;
       const requests = Array(4).fill(null).map(() => 
-        fetch(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ instances: { prompt: finalPrompt }, parameters: { sampleCount: 1 } })
-        }).then(res => res.json())
+        })
       );
       const responses = await Promise.all(requests);
       const images = responses.map(res => res.predictions?.[0]?.bytesBase64Encoded).filter(b => b).map(b => `data:image/png;base64,${b}`);
       if (images.length === 4) setPrintableResults(images);
-      else throw new Error("Gagal membuat sketsa.");
+      else throw new Error();
     } catch (err) { 
       try {
         const requests = Array(4).fill(null).map(() => 
-          fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+          fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: `Bold black and white outline coloring book page for kids, landscape 16:9: ${subject}. NO COLORS.` }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
-          }).then(res => res.json())
+            body: JSON.stringify({ contents: [{ parts: [{ text: `Coloring book line art, kids style: ${subject}. 16:9 landscape.` }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
+          })
         );
         const resps = await Promise.all(requests);
-        const imgs = resps.map(r => r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data).filter(b => b).map(b => `data:image/png;base64,${b}`);
-        if (imgs.length > 0) setPrintableResults(imgs);
-      } catch (e) { setError("Gagal membuat sketsa. Coba lagi!"); }
+        setPrintableResults(resps.map(r => `data:image/png;base64,${r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data}`).filter(b => b.length > 50));
+      } catch (e) { setError("Gagal membuat sketsa."); }
     } finally { setIsProcessingPrintable(false); }
   };
 
   const startLearnTheThing = async () => {
     const lang = learnLanguage === 'id' ? 'Bahasa Indonesia' : 'English';
-    let prompt = "";
-    if (learnMode === 'theme') {
-      const theme = customLearnTheme.trim() || selectedLearnTheme.name;
-      prompt = `Berikan daftar 26 kata benda dalam ${lang} untuk anak-anak (A-Z) bertema "${theme}". Untuk setiap kata, berikan "visualDescription" detail English agar tidak salah gambar. Balas JSON: [{"char": "A", "word": "...", "visualDescription": "..."}]`;
-    } else {
-      prompt = `Berikan daftar tepat 9 kata benda dalam ${lang} anak-anak yang SEMUANYA berawalan huruf "${selectedLearnLetter}". Berikan "visualDescription" detail English agar tidak salah gambar. Balas JSON: [{"char": "${selectedLearnLetter}", "word": "...", "visualDescription": "..."}]`;
-    }
+    let prompt = learnMode === 'theme' 
+      ? `Provide 26 words (A-Z) in ${lang} for kids about "${customLearnTheme || selectedLearnTheme.name}". Respond JSON: [{"char": "A", "word": "...", "visualDescription": "High-fidelity 3D Pixar model of word, white background"}]`
+      : `Provide 9 words in ${lang} starting with "${selectedLearnLetter}". Respond JSON: [{"char": "${selectedLearnLetter}", "word": "...", "visualDescription": "High-fidelity 3D Pixar model of word, white background"}]`;
+    
     setLearnStep('generating'); setLearnItems([]); setError(null);
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      const data = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } })
       });
-      const data = await response.json();
       const list = JSON.parse(data.candidates[0].content.parts[0].text);
       setLearnItems(list.map(item => ({ ...item, imageUrl: null })));
-      const updatedItems = [...list];
+      
+      const updated = [...list];
       for (let i = 0; i < list.length; i++) {
         const item = list[i];
-        const imgPrompt = `Cute 3D Pixar style illustration of ${item.visualDescription}. STRICT: subject is ${item.word}. No human faces on objects. Pure white background, portrait 3:4.`;
-        try {
-          const imgRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: imgPrompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } } )
-          });
-          const imgData = await imgRes.json();
-          const b64 = imgData.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-          if (b64) { updatedItems[i].imageUrl = `data:image/png;base64,${b64}`; setLearnItems([...updatedItems]); }
-        } catch (e) { console.error(item.word); }
+        fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: `Cute isolated 3D Pixar illustration: ${item.visualDescription}. PURE WHITE BACKGROUND. NO TEXT.` }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
+        }).then(imgRes => {
+          const b64 = imgRes.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+          if (b64) {
+            updated[i].imageUrl = `data:image/png;base64,${b64}`;
+            setLearnItems([...updated]);
+            const ttsTxt = `${item.char} ${learnLanguage === 'id' ? 'untuk' : 'is for'} ${item.word}`;
+            getTTSBlob(ttsTxt, learnLanguage).then(url => {
+              if (url) setAudioCache(prev => ({ ...prev, [`learn_${i}`]: url }));
+            });
+          }
+        });
       }
       setLearnStep('result');
-    } catch (err) { setError("Gagal menyiapkan materi."); setLearnStep('setup'); }
+    } catch (err) { setError("Gagal memuat materi."); setLearnStep('setup'); }
   };
 
-  const generateTTS = async (text, langCode = 'id') => {
-    if (isSpeaking) return; setIsSpeaking(true);
-    const speakerVoice = langCode === 'id' ? 'Kore' : 'Zephyr';
-    const emotionPrefix = langCode === 'id' ? 'Katakan dengan ceria: ' : 'Say cheerfully: ';
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: emotionPrefix + text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: speakerVoice } } } } })
-      });
-      const data = await response.json();
-      const pcmBase64 = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      const sampleRate = parseInt(data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType.split('rate=')[1]);
-      if (pcmBase64) {
-        const binaryString = window.atob(pcmBase64);
-        const pcmData = new Int16Array(binaryString.length / 2);
-        for (let i = 0; i < pcmData.length; i++) { pcmData[i] = binaryString.charCodeAt(i * 2) | (binaryString.charCodeAt(i * 2 + 1) << 8); }
-        const wavBlob = pcmToWav(pcmData, sampleRate);
-        const audio = new Audio(URL.createObjectURL(wavBlob)); audio.onended = () => setIsSpeaking(false); audio.play();
-      }
-    } catch (err) { setIsSpeaking(false); }
-  };
-
-  // --- NEW: ROBUST SOUND EXPLORER WITH STRICT VISUALS ---
   const startSoundExplorer = async () => {
-    const themeToUse = customSoundTheme.trim() || selectedSoundTheme.name;
+    const theme = customSoundTheme || selectedSoundTheme.name;
+    const prompt = `List exactly 6 items with distinct sounds for theme: "${theme}". JSON: [{"name": "...", "onomatopoeia": "...", "visualAnchor": "High quality 3D model, white background"}]`;
     setSoundStep('generating'); setSoundItems([]); setError(null);
     try {
-      const listPrompt = `Berikan daftar tepat 6 makhluk hidup atau benda yang mengeluarkan suara khas sesuai tema: "${themeToUse}". Pilih objek yang konkrit. Berikan: name, onomatopoeia, visualAnchor detail detail. Balas HANYA JSON.`;
-      const listResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      const data = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: listPrompt }] }], generationConfig: { responseMimeType: "application/json" } })
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } })
       });
-      const listData = await listResponse.json();
-      const list = JSON.parse(listData.candidates[0].content.parts[0].text);
+      const list = JSON.parse(data.candidates[0].content.parts[0].text);
       setSoundItems(list.map(item => ({ ...item, imageUrl: null })));
-      const updatedItems = [...list];
+      
+      const updated = [...list];
       for (let i = 0; i < list.length; i++) {
         const item = list[i];
-        const finalImgPrompt = `Cute high-fidelity 3D model illustration of ${item.visualAnchor}. STRICT RULES: No human face on inanimate objects. Real living biology for animals. PURE WHITE BACKGROUND, portrait 3:4.`;
-        try {
-          const imgRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: finalImgPrompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
-          });
-          const imgData = await imgRes.json();
-          const b64 = imgData.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-          if (b64) { updatedItems[i].imageUrl = `data:image/png;base64,${b64}`; setSoundItems([...updatedItems]); }
-        } catch (e) { console.error(item.name); }
+        fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: `Isolated high-fidelity 3D Pixar illustration: ${item.visualAnchor}. PURE WHITE BACKGROUND. NO TEXT.` }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
+        }).then(imgRes => {
+          const b64 = imgRes.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+          if (b64) {
+            updated[i].imageUrl = `data:image/png;base64,${b64}`;
+            setSoundItems([...updated]);
+            const ttsTxt = `${item.onomatopoeia}, itu adalah suara ${item.name}`;
+            getTTSBlob(ttsTxt, 'id').then(url => {
+              if (url) setAudioCache(prev => ({ ...prev, [`sound_${i}`]: url }));
+            });
+          }
+        });
       }
       setSoundStep('result');
-    } catch (err) { setError("Gagal memuat materi suara."); setSoundStep('setup'); }
+    } catch (err) { setError("Gagal memuat materi."); setSoundStep('setup'); }
   };
-
-  const generateSoundTTS = async (item) => {
-    if (isSpeaking) return; setIsSpeaking(true);
-    const textToSay = `Katakan dengan sangat ceria: ${item.onomatopoeia}, itu adalah suara ${item.name}`;
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: textToSay }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } } } })
-      });
-      const data = await response.json();
-      const pcmBase64 = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      const sampleRate = parseInt(data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType.split('rate=')[1] || "24000");
-      if (pcmBase64) {
-        const binaryString = window.atob(pcmBase64);
-        const pcmData = new Int16Array(binaryString.length / 2);
-        for (let i = 0; i < pcmData.length; i++) { pcmData[i] = binaryString.charCodeAt(i * 2) | (binaryString.charCodeAt(i * 2 + 1) << 8); }
-        const wavBlob = pcmToWav(pcmData, sampleRate);
-        const audio = new Audio(URL.createObjectURL(wavBlob)); 
-        audio.onended = () => setIsSpeaking(false); audio.play();
-      }
-    } catch (err) { setIsSpeaking(false); }
-  };
-
-  // --- Logic Shared ---
-  const downloadAllStory = () => { storyPages.forEach((item, idx) => { setTimeout(() => { const link = document.createElement('a'); link.href = item.image; link.download = `Buku_Cerita_Hal_${idx + 1}.png`; link.click(); }, idx * 400); }); };
-  const downloadAllPrintables = () => { printableResults.forEach((url, idx) => { setTimeout(() => { downloadA4Printable(url, idx); }, idx * 400); }); };
-  const downloadAllLearn = () => { learnItems.forEach((item, idx) => { if(item.imageUrl) setTimeout(() => { download34Portrait(item.imageUrl, `Kartu_Belajar_${item.char}_${item.word}`, idx); }, idx * 400); }); };
-  const downloadAllSounds = () => { soundItems.forEach((item, idx) => { if(item.imageUrl) setTimeout(() => { download34Portrait(item.imageUrl, `Suara_${item.name}`, idx); }, idx * 400); }); };
 
   const generateJobImages = async () => {
     if (!uploadedPhoto) return;
     setIsProcessingJobs(true); setJobResults([]); setError(null);
-    const base64Data = uploadedPhoto.split(',')[1];
-    const jobDescription = customJob || selectedJob.prompt;
-    let finalPrompt = isFuturePrediction 
-      ? `A high-quality professional studio photographic prediction of the child in the photo as a young adult (20-25 years old). High-fidelity, energetic appearance. Professionally dressed as ${jobDescription}. Photorealistic. 3:4 portrait.` 
-      : `A hyper-realistic professional photographic studio portrait of the child from the photo. The child is dressed as ${jobDescription}. 100% accurate face match. NO CARTOON. 3:4 portrait.`;
+    const variations = [
+      "standing confidently with a warm smile, professional lighting",
+      "sitting naturally at a desk, looking directly at camera",
+      "caught in a moment of professional action, heroic pose",
+      "side profile view, cinematic portrait, high fidelity"
+    ];
     try {
-      const requests = Array(4).fill(null).map(() => 
-        fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+      const requests = variations.map(pose => {
+        const agePrompt = isFuturePrediction 
+          ? "MANDATORY: Mature young adult (22 years old), adjusted jawline and facial structure. " 
+          : "STRICT: Keep child face EXACTLY as reference. 100% child face identity match. ";
+        const finalPrompt = `Hyper-realistic photographic studio portrait. ${agePrompt} Dressed as ${customJob || selectedJob.prompt}. Pose: ${pose}. Photorealistic high-fidelity 3:4 portrait.`;
+        return fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: finalPrompt }, { inlineData: { mimeType: "image/png", data: base64Data } }] }], generationConfig: { responseMimeType: "image/png" } })
-        }).then(res => res.json())
-      );
+          body: JSON.stringify({ contents: [{ parts: [{ text: finalPrompt }, { inlineData: { mimeType: "image/png", data: uploadedPhoto.split(',')[1] } }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
+        });
+      });
       const resps = await Promise.all(requests);
-      const imgs = resps.map(r => r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data).filter(b => b).map(b => `data:image/png;base64,${b}`);
-      if (imgs.length > 0) setJobResults(imgs);
-    } catch (err) { setError(err.message); }
+      setJobResults(resps.map(r => `data:image/png;base64,${r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data}`).filter(b => b.length > 50));
+    } catch (err) { setError("Gagal membuat foto."); }
     setIsProcessingJobs(false);
   };
 
   const handleStartSketchMagic = async () => {
     setIsProcessingSketch(true); setSketchResult(null); setSketchNarration(""); setError(null);
-    const sketchData = canvasRef.current.toDataURL('image/png');
-    setOriginalSketch(sketchData);
     try {
-      const transRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
+      const robustPrompt = `Advanced Artistic Transformation. Maintain spatial outlines of the user's sketch. Realize it as a ${selectedSketchPreset.prompt}. HIGH FIDELITY integrity of the user's core strokes.`;
+      const transData = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: `Transform sketch into ${selectedSketchPreset.prompt}` }, { inlineData: { mimeType: "image/png", data: sketchData.split(',')[1] } }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
+        body: JSON.stringify({ contents: [{ parts: [{ text: robustPrompt }, { inlineData: { mimeType: "image/png", data: canvasRef.current.toDataURL().split(',')[1] } }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
       });
-      const transData = await transRes.json();
       const b64 = transData.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
       if (b64) {
-        const narrationPrompt = `Lihat gambar hasil sulap ini. Berikan narasi panjang (3-4 kalimat), sangat imajinatif, ajaib, dan ceria untuk anak-anak dalam Bahasa Indonesia. JANGAN membalas dengan teks apa pun selain narasinya.`;
-        const narRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: narrationPrompt }, { inlineData: { mimeType: "image/png", data: b64 } }] }] })
+        setSketchResult(`data:image/png;base64,${b64}`);
+        const narData = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: "Provide a VERY SHORT imaginative 1-2 sentence narration in Indonesian for this magic sketch result." }, { inlineData: { mimeType: "image/png", data: b64 } }] }] })
         });
-        const narData = await narRes.json();
-        const narrationText = narData.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (narrationText) {
-          setSketchNarration(narrationText);
-          setSketchResult(`data:image/png;base64,${b64}`);
-          generateTTS(narrationText, 'id');
+        const narText = narData.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (narText) { 
+          setSketchNarration(narText); 
+          getTTSBlob(narText, 'id').then(url => {
+            if (url) setAudioCache(prev => ({ ...prev, 'magic_sketch': url }));
+          });
         }
       }
-    } catch (err) { setError(err.message); }
+    } catch (err) { setError("Gagal menyulap coretan."); }
     setIsProcessingSketch(false);
   };
 
-  useEffect(() => { if (view === 'sketch' && sketchStep === 'draw') setTimeout(initCanvas, 150); }, [view, sketchStep, orientation]);
+  useEffect(() => { if (view === 'sketch' && sketchStep === 'draw') setTimeout(initCanvas, 150); }, [view, sketchStep]);
 
   const initCanvas = () => {
     const canvas = canvasRef.current; if (!canvas) return;
-    const rect = canvas.parentElement.getBoundingClientRect(); const temp = canvas.toDataURL();
+    const rect = canvas.parentElement.getBoundingClientRect();
     canvas.width = rect.width; canvas.height = rect.height;
     const ctx = canvas.getContext('2d'); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.fillStyle = 'white'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    if (temp && temp !== 'data:,') { const img = new Image(); img.onload = () => ctx.drawImage(img, 0, 0); img.src = temp; }
     contextRef.current = ctx;
   };
 
@@ -602,27 +627,24 @@ const App = () => {
   const stopDrawing = () => { isDrawing.current = false; contextRef.current?.closePath(); };
   const clearCanvas = () => { contextRef.current.fillStyle = 'white'; contextRef.current.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height); };
 
-  // --- Render Sections ---
-
+  // --- RENDERS ---
   const renderMagicSketch = () => (
     <div className="min-h-screen bg-[#F0F7FF] font-['Fredoka_One',_cursive] pb-20">
       <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><h1 className="text-2xl font-black text-[#1982C4]">Magic Sketch</h1></div>
-        {sketchStep === 'draw' && <button onClick={() => { setSketchStep('setup'); setSketchResult(null); setSketchNarration(""); }} className="bg-gray-100 px-5 py-2 rounded-full font-bold transition-all text-sm">Ganti Kertas</button>}
+        <button onClick={clearCanvas} className="bg-red-50 text-red-500 px-5 py-2 rounded-full font-bold transition-all text-sm flex items-center gap-2"><RotateCcw size={18} /> Bersihkan</button>
       </header>
-      {sketchStep === 'setup' ? (<div className="flex flex-col items-center justify-center p-8 text-center max-w-4xl mx-auto min-h-[80vh]"><h2 className="text-5xl font-black text-[#2D3142] mb-10">Pilih Kertasmu! 🎨</h2><div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full"><button onClick={() => { setOrientation('landscape'); setSketchStep('draw'); }} className="group bg-white p-10 rounded-[3rem] shadow-xl border-8 border-transparent hover:border-[#1982C4]"><div className="aspect-video bg-blue-50 rounded-2xl mb-6 flex items-center justify-center"><Monitor size={80} className="text-[#1982C4]" /></div><p className="text-3xl font-black text-[#2D3142]">Lanskap</p></button><button onClick={() => { setOrientation('portrait'); setSketchStep('draw'); }} className="group bg-white p-10 rounded-[3rem] shadow-xl border-8 border-transparent hover:border-[#FF595E]"><div className="aspect-[3/4] w-40 mx-auto bg-red-50 rounded-2xl mb-6 flex items-center justify-center"><Smartphone size={80} className="text-[#FF595E]" /></div><p className="text-3xl font-black text-[#2D3142]">Potret</p></button></div></div>) : (
-        <div className="max-w-6xl mx-auto p-4 md:p-8 space-y-12">
-          <section className="flex flex-col md:flex-row gap-6 items-start">
-            <div className="bg-white p-4 rounded-3xl shadow-lg flex md:flex-col gap-4 w-full md:w-auto"><button onClick={() => setActiveTool('pencil')} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all ${activeTool === 'pencil' ? 'bg-[#1982C4] text-white scale-110 shadow-lg' : 'bg-gray-100 text-gray-400'}`}><Pencil size={28} /></button><button onClick={() => setActiveTool('eraser')} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all ${activeTool === 'eraser' ? 'bg-[#FF595E] text-white scale-110 shadow-lg' : 'bg-gray-100 text-gray-400'}`}><Eraser size={28} /></button><div className="h-[2px] bg-gray-100 w-full" /><div className="grid grid-cols-4 md:grid-cols-2 gap-2">{COLORS.map(c => <button key={c} onClick={() => { setActiveColor(c); setActiveTool('pencil'); }} className={`w-10 h-10 rounded-full border-4 transition-transform ${activeColor === c && activeTool === 'pencil' ? 'border-white ring-2 ring-blue-200' : 'border-transparent'}`} style={{ backgroundColor: c }} />)}</div><button onClick={clearCanvas} className="w-14 h-14 rounded-2xl bg-gray-50 text-gray-300 flex items-center justify-center hover:bg-red-50 hover:text-red-400"><RotateCcw size={24} /></button></div>
-            <div className="flex-1 w-full flex flex-col gap-4"><div className={`bg-white rounded-[2.5rem] shadow-2xl overflow-hidden border-8 border-white ring-8 ring-blue-100/30 ${orientation === 'landscape' ? 'w-full aspect-video' : 'w-full max-w-md mx-auto aspect-[3/4]'}`}><canvas ref={canvasRef} onMouseDown={startDrawing} onMouseMove={draw} onMouseUp={stopDrawing} onMouseLeave={stopDrawing} onTouchStart={startDrawing} onTouchMove={draw} onTouchEnd={stopDrawing} className="w-full h-full touch-none cursor-crosshair" /></div><div className="bg-white px-8 py-4 rounded-3xl shadow-sm flex items-center gap-6"><span className="font-bold text-gray-400">Ukuran:</span><input type="range" min="2" max="50" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} className="flex-1 accent-[#1982C4]" /></div></div>
-          </section>
-          <section className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white text-center"><h3 className="text-3xl font-black text-[#2D3142] mb-8">Gaya Sihir ✨</h3><div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-10">{PRESETS_SKETCH.map(p => <button key={p.id} onClick={() => setSelectedSketchPreset(p)} className={`p-6 rounded-3xl border-4 flex flex-col items-center gap-3 transition-all ${selectedSketchPreset.id === p.id ? 'border-[#1982C4] bg-blue-50 scale-105 shadow-md' : 'border-gray-50 hover:border-gray-200'}`}><span className="text-4xl">{p.icon}</span><span className="font-bold">{p.name}</span></button>)}</div><button onClick={handleStartSketchMagic} disabled={isProcessingSketch} className={`px-16 py-6 bg-gradient-to-r from-[#1982C4] to-[#6A4C93] text-white rounded-[2rem] font-black text-2xl shadow-xl flex items-center gap-3 mx-auto transition-all ${isProcessingSketch ? 'opacity-70 scale-95' : 'hover:scale-105'}`}>{isProcessingSketch ? <Loader2 className="animate-spin" size={32} /> : <Sparkles size={32} />}{isProcessingSketch ? 'SEDANG MENYULAP...' : 'SULAP GAMBAR!'}</button></section>
-          {isProcessingSketch && (<div className="bg-white rounded-[3rem] p-10 shadow-lg border-4 border-white text-center space-y-6 animate-pulse"><div className="w-full aspect-video bg-gray-100 rounded-[2.5rem] flex items-center justify-center"><ImageIcon size={80} className="text-gray-200" /></div><div className="h-10 w-64 bg-gray-100 rounded-full mx-auto" /></div>)}
-          {sketchResult && (
-            <section className="bg-yellow-400 rounded-[3rem] p-1 shadow-2xl animate-in zoom-in"><div className="bg-white rounded-[2.9rem] p-10 flex flex-col lg:flex-row gap-10"><div className="flex-1 relative group rounded-[2.5rem] overflow-hidden border-4 border-gray-100 cursor-pointer" onClick={() => { setModalImage(sketchResult); setModalType('sketch'); setShowModal(true); }}><img src={sketchResult} className="w-full h-full object-cover" alt="Hasil" /></div><div className="lg:w-72 space-y-6"><img src={originalSketch} className="w-full rounded-xl bg-white border" alt="Original" /><button onClick={() => downloadMagicResultWithSnapshot(sketchResult, originalSketch)} className="w-full py-5 bg-[#8AC926] text-white rounded-2xl font-black text-xl flex items-center justify-center gap-3 shadow-lg hover:bg-[#7ab322] transition-colors"><Download size={24} /> SIMPAN</button></div></div></section>
-          )}
-        </div>
-      )}
+      <div className="max-w-6xl mx-auto p-4 md:p-8 space-y-12 animate-in fade-in">
+        <section className="flex flex-col md:flex-row gap-6 items-start">
+          <div className="bg-white p-4 rounded-3xl shadow-lg flex md:flex-col gap-4 w-full md:w-auto"><button onClick={() => setActiveTool('pencil')} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all ${activeTool === 'pencil' ? 'bg-[#1982C4] text-white scale-110 shadow-lg' : 'bg-gray-100 text-gray-400'}`}><Pencil size={28} /></button><button onClick={() => setActiveTool('eraser')} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all ${activeTool === 'eraser' ? 'bg-[#FF595E] text-white scale-110 shadow-lg' : 'bg-gray-100 text-gray-400'}`}><Eraser size={28} /></button><div className="h-[2px] bg-gray-100 w-full" /><div className="grid grid-cols-4 md:grid-cols-2 gap-2">{COLORS.map(c => <button key={c} onClick={() => { setActiveColor(c); setActiveTool('pencil'); }} className={`w-10 h-10 rounded-full border-4 transition-transform ${activeColor === c && activeTool === 'pencil' ? 'border-white ring-2 ring-blue-200' : 'border-transparent'}`} style={{ backgroundColor: c }} />)}</div></div>
+          <div className="flex-1 w-full flex flex-col gap-4"><div className="bg-white rounded-[2.5rem] shadow-2xl overflow-hidden border-8 border-white ring-8 ring-blue-100/30 w-full aspect-video"><canvas ref={canvasRef} onMouseDown={startDrawing} onMouseMove={draw} onMouseUp={stopDrawing} onMouseLeave={stopDrawing} onTouchStart={startDrawing} onTouchMove={draw} onTouchEnd={stopDrawing} className="w-full h-full touch-none cursor-crosshair" /></div><div className="bg-white px-8 py-4 rounded-3xl shadow-sm flex items-center gap-6"><span className="font-bold text-gray-400 text-sm uppercase">Kuas:</span><input type="range" min="2" max="50" value={brushSize} onChange={(e) => setBrushSize(parseInt(e.target.value))} className="flex-1 accent-[#1982C4]" /></div></div>
+        </section>
+        <section className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white text-center"><h3 className="text-3xl font-black text-[#2D3142] mb-8">Sihir Lukisan ✨</h3><div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-10">{PRESETS_SKETCH.map(p => <button key={p.id} onClick={() => setSelectedSketchPreset(p)} className={`p-6 rounded-3xl border-4 flex flex-col items-center gap-3 transition-all ${selectedSketchPreset.id === p.id ? 'border-[#1982C4] bg-blue-50 scale-105 shadow-md' : 'border-gray-50 hover:border-gray-200'}`}><span className="text-4xl">{p.icon}</span><span className="font-bold">{p.name}</span></button>)}</div><button onClick={handleStartSketchMagic} disabled={isProcessingSketch} className={`px-16 py-6 bg-[#1982C4] text-white rounded-[2rem] font-black text-2xl shadow-xl flex items-center gap-3 mx-auto transition-all ${isProcessingSketch ? 'opacity-70 scale-95' : 'hover:scale-105 active:scale-95'}`}>{isProcessingSketch ? <Loader2 className="animate-spin" size={32} /> : <Sparkles size={32} />}{isProcessingSketch ? 'MENYULAP...' : 'SULAP GAMBAR!'}</button></section>
+        {isProcessingSketch && (<div className="bg-white rounded-[3rem] p-10 shadow-lg animate-pulse text-center"><div className="w-full aspect-video bg-gray-100 rounded-[2.5rem] flex items-center justify-center"><ImageIcon size={80} className="text-gray-200" /></div></div>)}
+        {sketchResult && (
+          <section className="bg-yellow-400 rounded-[3rem] p-1 shadow-2xl animate-in zoom-in"><div className="bg-white rounded-[2.9rem] p-10 flex flex-col lg:flex-row gap-10"><div className="flex-1 relative group rounded-[2.5rem] overflow-hidden border-4 border-gray-100 cursor-pointer" onClick={() => { setModalImage(sketchResult); setModalType('sketch'); setShowModal(true); }}><img src={sketchResult} className="w-full h-full object-cover" alt="Hasil" /><div className="absolute inset-0 bg-black/10 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center"><Maximize2 size={48} className="text-white drop-shadow-lg" /></div></div><div className="lg:w-72 space-y-6 flex flex-col items-center"><div className="w-full bg-blue-50 p-4 rounded-2xl border-4 border-white shadow-inner"><p className="text-[#1982C4] font-bold text-xs uppercase mb-2">Sketsa Asli:</p><img src={canvasRef.current?.toDataURL()} className="w-full rounded-xl bg-white border" alt="Original" /></div><button onClick={() => downloadMagicResultWithSnapshot(sketchResult, canvasRef.current?.toDataURL())} className="w-full py-5 bg-[#8AC926] text-white rounded-2xl font-black text-xl flex items-center justify-center gap-3 shadow-lg hover:brightness-95"><Download size={24} /> SIMPAN</button></div></div></section>
+        )}
+      </div>
     </div>
   );
 
@@ -634,23 +656,7 @@ const App = () => {
         <section className="bg-white rounded-[3rem] p-8 shadow-lg border-4 border-white flex flex-col md:flex-row items-center justify-between gap-6"><div><h3 className="text-2xl font-black text-[#2D3142] mb-1 flex items-center gap-2"><Timer className="text-[#FF595E]" /> Prediksi Masa Depan?</h3><p className="text-gray-400 text-sm">Lihat dirimu saat sudah dewasa!</p></div><button onClick={() => setIsFuturePrediction(!isFuturePrediction)} className={`relative w-20 h-10 rounded-full p-1 transition-colors ${isFuturePrediction ? 'bg-[#FF595E]' : 'bg-gray-200'}`}><div className={`w-8 h-8 bg-white rounded-full shadow-lg transform transition-transform ${isFuturePrediction ? 'translate-x-10' : 'translate-x-0'} flex items-center justify-center`}>{isFuturePrediction ? <Sparkles size={16} className="text-[#FF595E]" /> : <Baby size={16} className="text-gray-400" />}</div></button></section>
         <section className="bg-white rounded-[3rem] p-8 shadow-lg border-4 border-white"><h3 className="text-3xl font-black text-[#2D3142] mb-8 text-center">3. Pilih Cita-cita 🌟</h3><div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">{JOBS.map(job => <button key={job.id} onClick={() => { setSelectedJob(job); setCustomJob(""); }} className={`p-6 rounded-3xl border-4 flex flex-col items-center gap-3 transition-all ${selectedJob.id === job.id && !customJob ? 'border-[#FF595E] bg-red-50' : 'border-gray-50'}`}><span className="text-4xl">{job.icon}</span><span className="font-bold">{job.name}</span></button>)}</div><input type="text" placeholder="Tulis cita-citamu sendiri..." value={customJob} onChange={(e) => setCustomJob(e.target.value)} className="w-full px-6 py-4 bg-gray-50 border-2 rounded-2xl outline-none font-bold" /></section>
         <div className="flex justify-center"><button onClick={generateJobImages} disabled={!uploadedPhoto || isProcessingJobs} className={`px-16 py-7 rounded-[2.5rem] bg-[#FF595E] text-white font-black text-3xl shadow-xl flex items-center gap-3 transition-all ${isProcessingJobs ? 'opacity-70 scale-95 cursor-not-allowed' : 'hover:scale-105 active:scale-95'}`}>{isProcessingJobs ? <Loader2 className="animate-spin" size={32} /> : <Sparkles size={32} />}{isProcessingJobs ? 'SULAP...' : 'SULAP!'}</button></div>
-        <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 gap-8">
-          {isProcessingJobs ? (
-            Array(4).fill(0).map((_, i) => (
-              <div key={i} className="bg-white p-4 rounded-[3rem] shadow-xl border-4 border-white overflow-hidden">
-                <div className="aspect-[3/4] rounded-[2.2rem] bg-gray-100 animate-pulse flex items-center justify-center"><ImageIcon size={48} className="text-gray-200" /></div>
-                <div className="mt-6 flex justify-between items-center px-4"><div className="h-6 w-24 bg-gray-100 rounded-full animate-pulse" /><div className="h-10 w-10 bg-gray-100 rounded-xl animate-pulse" /></div>
-              </div>
-            ))
-          ) : (
-            jobResults.map((img, idx) => (
-              <div key={idx} className="bg-white p-4 rounded-[3rem] shadow-xl border-4 border-white overflow-hidden cursor-pointer" onClick={() => { setModalImage(img); setModalType('job'); setCurrentStoryIdx(idx); setShowModal(true); }}>
-                <div className="aspect-[3/4] rounded-[2.2rem] overflow-hidden"><img src={img} className="w-full h-full object-cover" alt="Result" /></div>
-                <div className="mt-4 flex justify-between items-center px-4"><span className="text-[#FF595E] font-black">Variasi {idx + 1}</span><button onClick={(e) => {e.stopPropagation(); download34Portrait(img, "CitaCita", idx);}} className="p-3 bg-red-50 text-[#FF595E] rounded-2xl hover:bg-[#FF595E] hover:text-white transition-colors"><Download size={20} /></button></div>
-              </div>
-            ))
-          )}
-        </div>
+        <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 gap-8">{isProcessingJobs ? Array(4).fill(0).map((_, i) => (<div key={i} className="bg-white p-4 rounded-[3rem] shadow-xl animate-pulse"><div className="aspect-[3/4] rounded-[2.2rem] bg-gray-100 flex items-center justify-center"><ImageIcon size={48} className="text-gray-200" /></div></div>)) : jobResults.map((img, idx) => (<div key={idx} className="bg-white p-4 rounded-[3rem] shadow-xl border-4 border-white overflow-hidden cursor-pointer" onClick={() => { setModalImage(img); setModalType('job'); setCurrentStoryIdx(idx); setShowModal(true); }}><div className="aspect-[3/4] rounded-[2.2rem] overflow-hidden"><img src={img} className="w-full h-full object-cover" alt="Result" /></div><div className="mt-4 flex justify-between items-center px-4"><span className="text-[#FF595E] font-black">Variasi {idx + 1}</span><button onClick={(e) => {e.stopPropagation(); download34Portrait(img, "CitaCita", idx);}} className="p-3 bg-red-50 text-[#FF595E] rounded-2xl hover:bg-[#FF595E] hover:text-white transition-colors"><Download size={20} /></button></div></div>))}</div>
       </div>
     </div>
   );
@@ -658,98 +664,57 @@ const App = () => {
   const renderStoryMaker = () => (
     <div className="min-h-screen bg-[#F0FAF0] font-['Fredoka_One',_cursive] pb-20">
       <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><div><h1 className="text-2xl font-black text-[#8AC926] leading-none">Story Maker</h1><p className="text-xs font-bold text-gray-400 tracking-widest uppercase">Penulis Cilik</p></div></div>
+        <div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><h1 className="text-2xl font-black text-[#8AC926]">Story Maker</h1></div>
         <div className="w-10 h-10 bg-[#8AC926] rounded-xl flex items-center justify-center shadow-lg"><BookOpen className="text-white w-6 h-6" /></div>
       </header>
       <div className="max-w-4xl mx-auto p-6 md:p-10 space-y-10">
         <section className="bg-white rounded-[3rem] p-10 shadow-lg border-4 border-white text-center">
-          <h2 className="text-3xl font-black text-[#2D3142] mb-6 text-center flex items-center justify-center gap-3"><Sparkles className="text-[#8AC926]" /> Rancang Ceritamu</h2>
+          <h2 className="text-3xl font-black text-[#2D3142] mb-6 flex items-center justify-center gap-3"><Sparkles className="text-[#8AC926]" /> Rancang Ceritamu</h2>
           <div className="space-y-8 max-w-2xl mx-auto">
-            <div className="space-y-4"><label className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Languages size={18} /> Bahasa Cerita</label>
+            <div className="space-y-4"><label className="text-xs font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Languages size={14} /> Bahasa Cerita</label>
               <div className="flex justify-center gap-4">
-                <button onClick={() => setStoryLanguage('id')} className={`px-10 py-4 rounded-2xl font-black text-lg transition-all ${storyLanguage === 'id' ? 'bg-[#8AC926] text-white shadow-lg scale-105' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>🇮🇩 Indonesia</button>
-                <button onClick={() => setStoryLanguage('en')} className={`px-10 py-4 rounded-2xl font-black text-lg transition-all ${storyLanguage === 'en' ? 'bg-[#8AC926] text-white shadow-lg scale-105' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>🇺🇸 English</button>
+                <button onClick={() => setStoryLanguage('id')} className={`px-6 py-3 rounded-2xl font-black transition-all ${storyLanguage === 'id' ? 'bg-[#8AC926] text-white shadow-lg' : 'bg-gray-50 text-gray-400'}`}>🇮🇩 Indonesia</button>
+                <button onClick={() => setStoryLanguage('en')} className={`px-6 py-3 rounded-2xl font-black transition-all ${storyLanguage === 'en' ? 'bg-[#8AC926] text-white shadow-lg' : 'bg-gray-50 text-gray-400'}`}>🇺🇸 English</button>
               </div>
             </div>
-            <div className="space-y-4"><label className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Camera size={18} /> Tokoh Utama (Opsional)</label>
-              {!storyPhoto ? (
-                <label className="flex flex-col items-center justify-center border-4 border-dashed border-green-100 bg-green-50 rounded-[2.5rem] p-10 cursor-pointer hover:bg-green-100 transition-colors group"><Upload size={40} className="text-[#8AC926] mb-3 group-hover:scale-110 transition-transform" /><span className="text-sm font-bold text-green-400">Upload Foto Anak Agar Menjadi Tokoh Cerita</span><input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, 'story')} /></label>
-              ) : (
-                <div className="relative w-48 mx-auto rounded-[2rem] overflow-hidden border-8 border-white shadow-xl group"><img src={storyPhoto} className="w-full aspect-square object-cover" alt="Anak" /><button onClick={() => setStoryPhoto(null)} className="absolute top-2 right-2 bg-white/90 p-2 rounded-full text-red-500 shadow-lg hover:bg-red-50 transition-colors opacity-0 group-hover:opacity-100"><X size={18} /></button></div>
-              )}
+            <div className="space-y-4"><label className="text-xs font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Camera size={14} /> Tokoh Utama</label>
+              {!storyPhoto ? (<label className="flex flex-col items-center justify-center border-4 border-dashed border-green-100 bg-green-50 rounded-3xl p-8 cursor-pointer hover:bg-green-100 transition-colors"><Upload size={32} className="text-[#8AC926] mb-2" /><span className="text-xs font-bold text-green-400">Pilih Foto Anak</span><input type="file" className="hidden" accept="image/*" onChange={(e) => handleFileUpload(e, 'story')} /></label>) : (<div className="relative w-32 mx-auto rounded-2xl overflow-hidden border-4 border-white shadow-lg group"><img src={storyPhoto} className="w-full aspect-square object-cover" alt="Anak" /><button onClick={() => setStoryPhoto(null)} className="absolute top-1 right-1 bg-white/90 p-1 rounded-full text-red-500 shadow-lg opacity-0 group-hover:opacity-100"><X size={14} /></button></div>)}
             </div>
-            <div className="space-y-4"><label className="text-sm font-black text-gray-400 uppercase tracking-widest text-left block ml-4">Ide Cerita Ajaibmu:</label><textarea value={storyIdea} onChange={(e) => setStoryIdea(e.target.value)} placeholder={storyLanguage === 'id' ? "Contoh: Petualangan Kura-kura mencari istana..." : "Example: The Turtle's Adventure to find a palace..."} className="w-full h-40 p-8 bg-gray-50 border-4 border-green-50 rounded-[2.5rem] focus:border-[#8AC926] outline-none font-bold text-xl transition-all resize-none shadow-inner" /></div>
-            <button onClick={createStory} disabled={!storyIdea.trim() || isProcessingStory} className={`mt-4 px-12 py-7 rounded-[2rem] font-black text-3xl flex items-center justify-center gap-4 shadow-xl transition-all w-full ${!storyIdea.trim() || isProcessingStory ? 'bg-gray-200 text-gray-400' : 'bg-[#8AC926] text-white hover:scale-105 active:scale-95 shadow-green-100'}`}>{isProcessingStory ? <Loader2 className="animate-spin" size={32} /> : <Send size={24} />}{isProcessingStory ? (storyLanguage === 'id' ? 'Sedang Menulis...' : 'Writing...') : (storyLanguage === 'id' ? 'MULAI SIHIR!' : 'START MAGIC!')}</button>
+            <textarea value={storyIdea} onChange={(e) => setStoryIdea(e.target.value)} placeholder="Misal: Petualangan kucing lucu di bulan..." className="w-full h-32 p-6 bg-gray-50 border-4 border-green-50 rounded-3xl focus:border-[#8AC926] outline-none font-bold text-lg resize-none" />
+            <button onClick={createStory} disabled={!storyIdea.trim() || isProcessingStory} className={`w-full py-6 rounded-[2rem] font-black text-2xl flex items-center justify-center gap-4 shadow-xl transition-all ${!storyIdea.trim() || isProcessingStory ? 'bg-gray-200 text-gray-400' : 'bg-[#8AC926] text-white hover:scale-105 active:scale-95'}`}>{isProcessingStory ? <Loader2 className="animate-spin" size={28} /> : <Send size={24} />}{isProcessingStory ? 'SEDANG MENULIS...' : 'MULAI SIHIR!'}</button>
           </div>
         </section>
-        {isProcessingStory && (<div className="bg-white rounded-[3rem] p-10 shadow-lg border-4 border-white text-center space-y-6"><h4 className="text-2xl font-black text-[#2D3142]">Buku sedang dibuat... ✨</h4><div className="w-full bg-gray-100 h-4 rounded-full overflow-hidden"><div className="h-full bg-[#8AC926] transition-all duration-500" style={{ width: `${(storyPages.length / 12) * 100}%` }} /></div><p className="text-gray-400 font-bold uppercase text-xs">Menggambar Halaman {storyPages.length} dari 12</p></div>)}
-        {storyPages.length > 0 && (<section className="space-y-8 animate-in fade-in slide-in-from-bottom-10 pb-20"><div className="flex flex-col md:flex-row justify-between items-center gap-4"><h3 className="text-4xl font-black text-[#2D3142]">Buku Ceritamu! 📚</h3><button onClick={downloadAllStory} className="px-8 py-4 bg-[#1982C4] text-white rounded-2xl font-black shadow-lg hover:brightness-95 flex items-center gap-2"><Download size={20} /> Simpan Semua</button></div><div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">{storyPages.map((page, idx) => (<div key={idx} className="group relative bg-white p-3 rounded-[2rem] shadow-xl border-4 border-white overflow-hidden cursor-pointer" onClick={() => { setCurrentStoryIdx(idx); setModalImage(page.image); setModalType('story'); setShowModal(true); }}><div className="aspect-video rounded-[1.5rem] overflow-hidden"><img src={page.image} className="w-full h-full object-cover transition-transform group-hover:scale-105" alt={`Page ${idx+1}`} /></div><div className="mt-3 text-center"><span className="font-black text-[#8AC926]">Halaman {idx + 1}</span></div></div>))}</div></section>)}
-      </div>
-    </div>
-  );
-
-  const renderPrintableSketch = () => (
-    <div className="min-h-screen bg-[#FFFBEB] font-['Fredoka_One',_cursive] pb-20">
-      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><div><h1 className="text-2xl font-black text-[#FFCA3A] leading-none">Printable Sketch</h1><p className="text-xs font-bold text-gray-400 tracking-widest uppercase">Mewarnai Asyik</p></div></div>
-        <div className="w-10 h-10 bg-[#FFCA3A] rounded-xl flex items-center justify-center shadow-lg"><Printer className="text-white w-6 h-6" /></div>
-      </header>
-      <div className="max-w-5xl mx-auto p-6 md:p-10 space-y-10">
-        <section className="bg-white rounded-[3rem] p-10 shadow-lg border-4 border-white">
-          <h3 className="text-3xl font-black text-[#2D3142] mb-8 text-center">Pilih Tema Mewarnai! 🎨</h3>
-          <div className="flex flex-wrap justify-center gap-4 mb-8">{PRINTABLE_CATEGORIES.map(cat => (<button key={cat.id} onClick={() => { setPrintableCategory(cat); setPrintableSubject(cat.items[0].name); setCustomPrintable(""); }} className={`flex items-center gap-2 px-6 py-3 rounded-2xl font-bold transition-all border-4 ${printableCategory.id === cat.id ? `bg-white border-[#FFCA3A] ${cat.color} shadow-lg scale-105` : 'bg-gray-50 border-transparent text-gray-400 hover:bg-gray-100'}`}>{cat.icon} <span>{cat.name}</span></button>))}</div>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 mb-10">{printableCategory.items.map(item => (<button key={item.name} onClick={() => { setPrintableSubject(item.name); setCustomPrintable(""); }} className={`p-4 rounded-3xl border-4 font-black text-xl transition-all flex flex-col items-center gap-2 ${printableSubject === item.name && !customPrintable ? `border-[#FFCA3A] ${printableCategory.bg} ${printableCategory.color} scale-105 shadow-md` : 'border-gray-50 text-gray-400 hover:border-gray-100'}`}><span className="text-4xl">{item.icon}</span><span>{item.name}</span></button>))}</div>
-          <div className="flex flex-col gap-3 max-w-xl mx-auto mb-10"><label className="text-sm font-bold text-gray-400 ml-4 uppercase">Atau tulis ide mewarnaimu:</label><input type="text" placeholder="Misal: Dinosaurus makan es krim..." value={customPrintable} onChange={(e) => setCustomPrintable(e.target.value)} className="w-full px-8 py-5 bg-gray-50 border-4 border-gray-100 rounded-3xl outline-none font-bold focus:border-[#FFCA3A] text-xl transition-all" /></div>
-          <div className="flex justify-center"><button onClick={generatePrintableSketches} disabled={isProcessingPrintable} className={`px-16 py-7 rounded-[2.5rem] font-black text-3xl flex items-center justify-center gap-4 shadow-xl transition-all w-full md:w-auto ${isProcessingPrintable ? 'bg-gray-200 text-gray-400' : 'bg-gradient-to-r from-[#FFCA3A] to-[#FF924C] text-white shadow-yellow-100'}`}>{isProcessingPrintable ? <Loader2 className="animate-spin" size={40} /> : <Printer size={40} />} {isProcessingSketch ? 'Sedang Melukis...' : 'BUAT SKETSA A4!'}</button></div>
-        </section>
-        {printableResults.length > 0 && (<section className="space-y-8 animate-in fade-in slide-in-from-bottom-10"><div className="flex flex-col md:flex-row justify-between items-center gap-4"><h3 className="text-4xl font-black text-[#2D3142]">Hasil Sketsa A4 🗒️</h3><button onClick={downloadAllPrintables} className="px-8 py-4 bg-[#1982C4] text-white rounded-2xl font-black flex items-center gap-3 shadow-lg hover:brightness-95 transition-all"><Download size={20} /> Simpan Semua (A4 Landscape)</button></div><div className="grid grid-cols-1 md:grid-cols-2 gap-8">{printableResults.map((img, idx) => (<div key={idx} className="bg-white p-4 rounded-[3.5rem] shadow-xl border-4 border-white overflow-hidden group"><div className="aspect-[1.414/1] rounded-[2.5rem] overflow-hidden cursor-pointer bg-gray-50 border-2 relative" onClick={() => { setModalImage(img); setModalType('printable'); setShowModal(true); }}><img src={img} className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" alt={`Sketch ${idx+1}`} /><div className="absolute inset-0 bg-black/5 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity"><div className="bg-white p-5 rounded-full text-[#FFCA3A] shadow-2xl scale-0 group-hover:scale-100 transition-transform duration-300"><Maximize2 size={40} /></div></div></div><div className="mt-6 flex justify-between items-center px-6"><span className="text-[#FFCA3A] font-black text-xl">Variasi {idx + 1}</span><button onClick={() => downloadA4Printable(img, idx)} className="p-4 bg-yellow-50 text-[#FFCA3A] rounded-2xl hover:bg-[#FFCA3A] transition-colors shadow-sm"><Download size={24} /></button></div></div>))}</div></section>)}
+        {isProcessingStory && (<div className="bg-white rounded-[3rem] p-10 shadow-lg border-4 border-white text-center space-y-4"><h4 className="text-xl font-black text-[#2D3142]">Buku sedang dibuat... ✨</h4><div className="w-full bg-gray-100 h-3 rounded-full overflow-hidden"><div className="h-full bg-[#8AC926] transition-all duration-500" style={{ width: `${(storyPages.length / 12) * 100}%` }} /></div><p className="text-xs font-bold text-gray-400 uppercase">Halaman {storyPages.length} dari 12</p></div>)}
+        {storyPages.length > 0 && (<section className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">{storyPages.map((page, idx) => (<div key={idx} className="group bg-white p-3 rounded-[2rem] shadow-xl border-4 border-white cursor-pointer" onClick={() => { setCurrentStoryIdx(idx); setModalImage(page.image); setModalType('story'); setShowModal(true); }}><div className="aspect-video rounded-[1.5rem] overflow-hidden"><img src={page.image} className="w-full h-full object-cover transition-transform group-hover:scale-110" alt={`Page ${idx+1}`} /></div><div className="mt-3 text-center"><span className="font-black text-[#8AC926]">Halaman {idx + 1}</span></div></div>))}</section>)}
       </div>
     </div>
   );
 
   const renderLearnTheThing = () => (
     <div className="min-h-screen bg-[#F5F3FF] font-['Fredoka_One',_cursive] pb-20">
-      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50"><div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><div><h1 className="text-2xl font-black text-[#9B5DE5] leading-none">Learn The Thing</h1><p className="text-xs font-bold text-gray-400 tracking-widest uppercase">Alfabet Ceria</p></div></div><div className="w-10 h-10 bg-[#9B5DE5] rounded-xl flex items-center justify-center shadow-lg"><Type className="text-white w-6 h-6" /></div></header>
+      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50"><div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><h1 className="text-2xl font-black text-[#9B5DE5]">Learn The Thing</h1></div><div className="w-10 h-10 bg-[#9B5DE5] rounded-xl flex items-center justify-center shadow-lg"><Type className="text-white w-6 h-6" /></div></header>
       <div className="max-w-7xl mx-auto p-6 md:p-10">
-        {learnStep === 'setup' && (
-          <div className="max-w-4xl mx-auto text-center space-y-10 py-6 animate-in fade-in zoom-in">
-            <div className="space-y-4"><h2 className="text-5xl font-black text-[#2D3142]">Ayo Belajar! 🎒</h2><p className="text-gray-400 text-xl">Atur petualangan belajarmu hari ini</p></div>
+        {learnStep === 'setup' ? (
+          <div className="max-w-4xl mx-auto text-center space-y-10 py-6 animate-in zoom-in">
+            <div className="space-y-4"><h2 className="text-5xl font-black text-[#2D3142]">Ayo Belajar! 🎒</h2><p className="text-gray-400 text-xl">Pilih petualangan belajarmu hari ini</p></div>
             <div className="bg-white p-8 rounded-[3.5rem] shadow-xl border-4 border-white space-y-8">
-              <div className="space-y-4"><label className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Languages size={18} /> Pilih Bahasa</label>
-                <div className="flex justify-center gap-4">
-                  <button onClick={() => setLearnLanguage('id')} className={`px-8 py-4 rounded-2xl font-black text-lg transition-all ${learnLanguage === 'id' ? 'bg-[#9B5DE5] text-white shadow-lg scale-105' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>🇮🇩 Indonesia</button>
-                  <button onClick={() => setLearnLanguage('en')} className={`px-8 py-4 rounded-2xl font-black text-lg transition-all ${learnLanguage === 'en' ? 'bg-[#9B5DE5] text-white shadow-lg scale-105' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>🇺🇸 English</button>
-                </div>
-              </div>
-              <div className="space-y-4"><label className="text-sm font-black text-gray-400 uppercase tracking-widest flex items-center justify-center gap-2"><Tags size={18} /> Pilih Cara Belajar</label>
-                <div className="flex justify-center gap-4">
-                  <button onClick={() => setLearnMode('theme')} className={`flex-1 max-w-xs py-4 rounded-2xl font-black transition-all flex items-center justify-center gap-2 ${learnMode === 'theme' ? 'bg-purple-100 text-[#9B5DE5] border-4 border-[#9B5DE5]' : 'bg-gray-50 text-gray-400 grayscale border-4 border-transparent'}`}><Sparkles size={20} /> Berdasarkan Tema</button>
-                  <button onClick={() => setLearnMode('alphabet')} className={`flex-1 max-w-xs py-4 rounded-2xl font-black transition-all flex items-center justify-center gap-2 ${learnMode === 'alphabet' ? 'bg-purple-100 text-[#9B5DE5] border-4 border-[#9B5DE5]' : 'bg-gray-50 text-gray-400 grayscale border-4 border-transparent'}`}><SpellCheck size={20} /> Per Huruf Alfabet</button>
-                </div>
+              <div className="flex justify-center gap-4">
+                <button onClick={() => setLearnMode('theme')} className={`flex-1 py-4 rounded-2xl font-black transition-all border-4 ${learnMode === 'theme' ? 'bg-purple-100 text-[#9B5DE5] border-[#9B5DE5]' : 'bg-gray-50 text-gray-400 border-transparent'}`}>Berdasarkan Tema</button>
+                <button onClick={() => setLearnMode('alphabet')} className={`flex-1 py-4 rounded-2xl font-black transition-all border-4 ${learnMode === 'alphabet' ? 'bg-purple-100 text-[#9B5DE5] border-[#9B5DE5]' : 'bg-gray-50 text-gray-400 border-transparent'}`}>Per Huruf Alfabet</button>
               </div>
               {learnMode === 'theme' ? (
                 <div className="space-y-6">
-                  <div className="grid grid-cols-2 gap-4">
-                    {LEARN_THEMES.map(theme => (
-                      <button key={theme.id} onClick={() => { setSelectedLearnTheme(theme); setCustomLearnTheme(""); }} className={`p-6 rounded-[2.5rem] border-4 transition-all flex flex-col items-center gap-2 shadow-sm ${selectedLearnTheme.id === theme.id && !customLearnTheme ? 'border-[#9B5DE5] bg-purple-50' : 'border-gray-50 bg-white opacity-60'}`}>
-                        <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${theme.color} ${theme.bg}`}>{React.cloneElement(theme.icon, { size: 28 })}</div><span className={`font-black ${theme.color}`}>{theme.name}</span>
-                      </button>
-                    ))}
-                  </div>
-                  <input type="text" placeholder="Atau tema sendiri: Robot, Dinosaurus..." value={customLearnTheme} onChange={(e) => setCustomLearnTheme(e.target.value)} className="w-full px-8 py-5 bg-gray-50 border-4 border-purple-50 rounded-[2rem] outline-none font-bold focus:border-[#9B5DE5] text-xl transition-all shadow-inner" />
+                  <div className="grid grid-cols-2 gap-4">{LEARN_THEMES.map(theme => (<button key={theme.id} onClick={() => { setSelectedLearnTheme(theme); setCustomLearnTheme(""); }} className={`p-4 rounded-3xl border-4 transition-all flex flex-col items-center gap-2 ${selectedLearnTheme.id === theme.id && !customLearnTheme ? 'border-[#9B5DE5] bg-purple-50' : 'border-gray-50 opacity-60'}`}><div className={`w-12 h-12 rounded-xl flex items-center justify-center ${theme.color} ${theme.bg}`}>{React.cloneElement(theme.icon, { size: 24 })}</div><span className={`font-black ${theme.color}`}>{theme.name}</span></button>))}</div>
+                  <input type="text" placeholder="Atau tema sendiri: Robot, Dinosaurus..." value={customLearnTheme} onChange={(e) => setCustomLearnTheme(e.target.value)} className="w-full px-6 py-4 bg-gray-50 border-4 border-purple-50 rounded-[2rem] outline-none font-bold focus:border-[#9B5DE5] text-lg transition-all" />
                 </div>
-              ) : (
-                <div className="space-y-6"><p className="text-gray-400 font-bold uppercase text-xs">Pilih Satu Huruf:</p><div className="grid grid-cols-6 sm:grid-cols-9 gap-2">{ALPHABET_LIST.map(char => (<button key={char} onClick={() => setSelectedLearnLetter(char)} className={`w-10 h-10 rounded-xl font-black text-lg flex items-center justify-center transition-all ${selectedLearnLetter === char ? 'bg-[#9B5DE5] text-white scale-110 shadow-md' : 'bg-gray-50 text-gray-300 hover:bg-gray-100'}`}>{char}</button>))}</div></div>
-              )}
+              ) : (<div className="grid grid-cols-6 sm:grid-cols-9 gap-2">{ALPHABET_LIST.map(char => (<button key={char} onClick={() => setSelectedLearnLetter(char)} className={`w-10 h-10 rounded-xl font-black text-lg flex items-center justify-center transition-all ${selectedLearnLetter === char ? 'bg-[#9B5DE5] text-white scale-110 shadow-md' : 'bg-gray-50 text-gray-300'}`}>{char}</button>))}</div>)}
             </div>
-            <button onClick={startLearnTheThing} className="px-20 py-8 bg-[#9B5DE5] text-white rounded-[2.5rem] font-black text-3xl shadow-2xl hover:scale-105 active:scale-95 transition-all flex items-center gap-4 mx-auto uppercase tracking-wide"><Sparkles size={32} /> MULAI BELAJAR!</button>
+            <button onClick={startLearnTheThing} className="px-20 py-8 bg-[#9B5DE5] text-white rounded-[2.5rem] font-black text-3xl shadow-2xl hover:scale-105 active:scale-95 flex items-center gap-4 mx-auto"><Sparkles size={32} /> MULAI!</button>
           </div>
-        )}
-        {(learnStep === 'generating' || learnStep === 'result') && (
-          <div className="space-y-10 animate-in fade-in duration-500">
-            <div className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white flex flex-col md:flex-row items-center justify-between gap-6"><div className="flex items-center gap-4"><div className={`w-16 h-16 rounded-2xl flex items-center justify-center bg-purple-50 text-[#9B5DE5]`}>{learnMode === 'theme' ? <Tags size={32} /> : <span className="text-3xl font-black">{selectedLearnLetter}</span>}</div><div><h3 className="text-2xl font-black text-[#2D3142]">Belajar: {learnMode === 'theme' ? (customLearnTheme || selectedLearnTheme.name) : `Huruf ${selectedLearnLetter}`}</h3><p className="text-gray-400">Bahasa: {learnLanguage === 'id' ? '🇮🇩 Indonesia' : '🇺🇸 English'}</p></div></div><div className="flex gap-4">{learnStep === 'result' && (<button onClick={downloadAllLearn} className="px-8 py-4 bg-[#8AC926] text-white rounded-2xl font-black shadow-lg hover:brightness-95 transition-all flex items-center gap-2"><Download size={20} /> Simpan Semua</button>)}<button onClick={() => setLearnStep('setup')} className="px-6 py-4 bg-gray-100 text-gray-500 rounded-2xl font-bold hover:bg-gray-200 transition-colors">Tutup</button></div></div>
-            {learnStep === 'generating' && (<div className="bg-white rounded-[3rem] p-8 shadow-lg border-4 border-white text-center space-y-4"><h4 className="text-xl font-black text-[#9B5DE5] flex items-center justify-center gap-2"><Loader2 className="animate-spin" /> Menyiapkan kartu edukasi...</h4><div className="w-full bg-gray-100 h-4 rounded-full overflow-hidden"><div className="h-full bg-[#9B5DE5] transition-all duration-500" style={{ width: `${(learnItems.filter(i => i.imageUrl).length / learnItems.length) * 100}%` }} /></div></div>)}
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6 pb-20">{learnItems.map((item, idx) => (<button key={idx} onClick={() => { if (item.imageUrl) { setSelectedLetterItem(item); setCurrentStoryIdx(idx); setModalImage(item.imageUrl); setModalType('learn'); setShowModal(true); } }} disabled={!item.imageUrl} className={`group relative aspect-[3/4] rounded-[2.5rem] p-4 shadow-xl hover:shadow-2xl hover:-translate-y-2 transition-all flex flex-col border-4 border-white bg-white ${!item.imageUrl ? 'opacity-50 cursor-wait grayscale' : ''}`}><span className="text-4xl font-black text-gray-200 absolute top-2 left-3">{item.char}</span><div className="flex-1 flex items-center justify-center w-full">{item.imageUrl ? (<img src={item.imageUrl} className="w-full h-full object-cover rounded-2xl transform group-hover:scale-110 transition-transform" alt={item.word} />) : (<Loader2 className="animate-spin text-gray-300" size={40} />)}</div><div className="text-center w-full bg-purple-50 rounded-2xl py-2 mt-2"><span className="text-2xl font-black block text-[#9B5DE5] leading-none">{item.char}</span><span className="text-[10px] font-bold uppercase tracking-widest text-[#9B5DE5] block truncate">{item.imageUrl ? item.word : 'Membuat...'}</span></div></button>))}</div>
+        ) : (
+          <div className="space-y-10 animate-in fade-in">
+            <div className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white flex flex-col md:flex-row items-center justify-between gap-6"><div className="flex items-center gap-4"><div className="w-16 h-16 rounded-2xl flex items-center justify-center bg-purple-50 text-[#9B5DE5]">{learnMode === 'theme' ? <Tags size={32} /> : <span className="text-3xl font-black">{selectedLearnLetter}</span>}</div><h3 className="text-2xl font-black text-[#2D3142]">Materi: {learnMode === 'theme' ? (customLearnTheme || selectedLearnTheme.name) : `Huruf ${selectedLearnLetter}`}</h3></div><button onClick={() => setLearnStep('setup')} className="px-6 py-3 bg-gray-100 text-gray-500 rounded-2xl font-bold hover:bg-gray-200">Ganti Materi</button></div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6">{learnItems.map((item, idx) => (<button key={idx} onClick={() => { if (item.imageUrl) { setSelectedLetterItem(item); setCurrentStoryIdx(idx); setModalImage(item.imageUrl); setModalType('learn'); setShowModal(true); } }} disabled={!item.imageUrl} className={`group relative aspect-[3/4] rounded-[2.5rem] p-4 shadow-xl transition-all flex flex-col border-4 border-white bg-white ${!item.imageUrl ? 'opacity-50 grayscale' : 'hover:-translate-y-2'}`}><span className="text-4xl font-black text-gray-200 absolute top-2 left-3">{item.char}</span><div className="flex-1 flex items-center justify-center w-full">{item.imageUrl ? (<img src={item.imageUrl} className="w-full h-full object-cover rounded-2xl transform group-hover:scale-110 transition-transform" alt={item.word} />) : (<Loader2 className="animate-spin text-gray-300" size={40} />)}</div><div className="text-center w-full bg-purple-50 rounded-2xl py-2 mt-2"><span className="text-lg font-black block text-[#9B5DE5] leading-none uppercase">{item.imageUrl ? item.word : '...'}</span></div></button>))}</div>
           </div>
         )}
       </div>
@@ -758,21 +723,19 @@ const App = () => {
 
   const renderSoundExplorer = () => (
     <div className="min-h-screen bg-[#E0F7FA] font-['Fredoka_One',_cursive] pb-20">
-      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50"><div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><div><h1 className="text-2xl font-black text-[#00BBF9] leading-none">Sound Explorer</h1><p className="text-xs font-bold text-gray-400 tracking-widest uppercase">Penjelajah Suara</p></div></div><div className="w-10 h-10 bg-[#00BBF9] rounded-xl flex items-center justify-center shadow-lg"><Speaker className="text-white w-6 h-6" /></div></header>
+      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50"><div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><h1 className="text-2xl font-black text-[#00BBF9]">Sound Explorer</h1></div><div className="w-10 h-10 bg-[#00BBF9] rounded-xl flex items-center justify-center shadow-lg"><Speaker className="text-white w-6 h-6" /></div></header>
       <div className="max-w-7xl mx-auto p-6 md:p-10">
-        {soundStep === 'setup' && (
-          <div className="max-w-3xl mx-auto text-center space-y-10 py-10 animate-in fade-in zoom-in">
-            <div className="space-y-4"><h2 className="text-5xl font-black text-[#2D3142]">Pilih Tema Suara! 🔊</h2><p className="text-gray-400 text-xl">Dunia suara apa yang ingin kamu dengar?</p></div>
-            <div className="grid grid-cols-2 gap-6">{SOUND_THEMES.map(theme => (<button key={theme.id} onClick={() => { setSelectedSoundTheme(theme); setCustomSoundTheme(""); }} className={`p-8 rounded-[3rem] border-8 transition-all flex flex-col items-center gap-4 shadow-xl hover:scale-105 ${selectedSoundTheme.id === theme.id && !customSoundTheme ? 'border-[#00BBF9] bg-white' : 'border-transparent bg-white/50 opacity-60 hover:opacity-100'}`}><div className={`w-20 h-20 rounded-3xl flex items-center justify-center ${theme.color} ${theme.bg}`}>{React.cloneElement(theme.icon, { size: 40 })}</div><span className={`text-2xl font-black ${theme.color}`}>{theme.name}</span></button>))}</div>
-            <div className="flex flex-col gap-3 max-w-xl mx-auto"><label className="text-sm font-bold text-gray-400 ml-4 uppercase text-left">Tema suaramu sendiri:</label><input type="text" placeholder="Misal: Robot, Alat Bengkel..." value={customSoundTheme} onChange={(e) => setCustomSoundTheme(e.target.value)} className="w-full px-8 py-5 bg-white border-4 border-cyan-100 rounded-[2rem] outline-none font-bold focus:border-[#00BBF9] text-xl transition-all shadow-inner" /></div>
-            <button onClick={startSoundExplorer} className="px-20 py-8 bg-[#00BBF9] text-white rounded-[2.5rem] font-black text-3xl shadow-2xl hover:scale-105 active:scale-95 transition-all flex items-center gap-4 mx-auto"><Mic2 size={32} /> MULAI!</button>
+        {soundStep === 'setup' ? (
+          <div className="max-w-3xl mx-auto text-center space-y-10 py-10 animate-in zoom-in">
+            <div className="space-y-4"><h2 className="text-5xl font-black text-[#2D3142]">Dunia Suara! 🔊</h2><p className="text-gray-400 text-xl">Dunia suara apa yang ingin kamu dengar?</p></div>
+            <div className="grid grid-cols-2 gap-6">{SOUND_THEMES.map(theme => (<button key={theme.id} onClick={() => { setSelectedSoundTheme(theme); setCustomSoundTheme(""); }} className={`p-8 rounded-[3rem] border-8 transition-all flex flex-col items-center gap-4 shadow-xl hover:scale-105 ${selectedSoundTheme.id === theme.id && !customSoundTheme ? 'border-[#00BBF9] bg-white' : 'border-transparent bg-white/50 opacity-60'}`}><div className={`w-16 h-16 rounded-3xl flex items-center justify-center ${theme.color} ${theme.bg}`}>{React.cloneElement(theme.icon, { size: 32 })}</div><span className={`text-xl font-black ${theme.color}`}>{theme.name}</span></button>))}</div>
+            <input type="text" placeholder="Atau tema suaramu sendiri..." value={customSoundTheme} onChange={(e) => setCustomSoundTheme(e.target.value)} className="w-full px-8 py-5 bg-white border-4 border-cyan-100 rounded-[2rem] outline-none font-bold focus:border-[#00BBF9] text-xl transition-all" />
+            <button onClick={startSoundExplorer} className="px-20 py-8 bg-[#00BBF9] text-white rounded-[2.5rem] font-black text-3xl shadow-2xl hover:scale-105 active:scale-95 flex items-center gap-4 mx-auto"><Mic2 size={32} /> MULAI!</button>
           </div>
-        )}
-        {(soundStep === 'generating' || soundStep === 'result') && (
-          <div className="space-y-10 animate-in fade-in duration-500">
-            <div className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white flex flex-col md:flex-row items-center justify-between gap-6"><div className="flex items-center gap-4"><div className={`w-16 h-16 rounded-2xl flex items-center justify-center bg-cyan-50 text-[#00BBF9]`}><Speaker size={32} /></div><div><h3 className="text-2xl font-black text-[#2D3142]">Materi: {customSoundTheme || selectedSoundTheme.name}</h3><p className="text-gray-400">Klik kartu untuk mendengar suaranya!</p></div></div><div className="flex gap-4">{soundStep === 'result' && (<button onClick={downloadAllSounds} className="px-8 py-4 bg-[#8AC926] text-white rounded-2xl font-black shadow-lg hover:brightness-95 flex items-center gap-2"><Download size={20} /> Simpan Semua</button>)}<button onClick={() => setSoundStep('setup')} className="px-6 py-4 bg-gray-100 text-gray-500 rounded-2xl font-bold hover:bg-gray-200 transition-colors">Ganti Tema</button></div></div>
-            {soundStep === 'generating' && (<div className="bg-white rounded-[3rem] p-8 shadow-lg border-4 border-white text-center space-y-4"><h4 className="text-xl font-black text-[#00BBF9] flex items-center justify-center gap-2"><Loader2 className="animate-spin" /> Menyiapkan 6 suara ajaib...</h4><div className="w-full bg-gray-100 h-4 rounded-full overflow-hidden"><div className="h-full bg-[#00BBF9] transition-all duration-500" style={{ width: `${(soundItems.filter(i => i.imageUrl).length / 6) * 100}%` }} /></div></div>)}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8 pb-20">{soundItems.map((item, idx) => (<button key={idx} onClick={() => { if (item.imageUrl) { setSelectedSoundItem(item); setCurrentStoryIdx(idx); setModalImage(item.imageUrl); setModalType('sound'); setShowModal(true); } }} disabled={!item.imageUrl} className={`group relative aspect-[3/4] rounded-[3.5rem] p-4 shadow-xl hover:shadow-2xl hover:-translate-y-2 transition-all flex flex-col border-4 border-white bg-white ${!item.imageUrl ? 'opacity-50 cursor-wait' : ''}`}><div className="flex-1 flex items-center justify-center w-full">{item.imageUrl ? (<img src={item.imageUrl} className="w-full h-full object-cover rounded-[2.5rem] transform group-hover:scale-110 transition-transform" alt={item.name} />) : (<div className="flex flex-col items-center gap-4"><Loader2 className="animate-spin text-gray-300" size={60} /><span className="font-bold text-gray-300 uppercase text-xs">Mencari {item.name}...</span></div>)}</div><div className="text-center w-full bg-cyan-50 rounded-3xl py-4 mt-4"><span className="text-2xl font-black block text-[#00BBF9] uppercase tracking-wider">{item.imageUrl ? item.name : '...'}</span></div></button>))}</div>
+        ) : (
+          <div className="space-y-10 animate-in fade-in">
+            <div className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white flex flex-col md:flex-row items-center justify-between gap-6"><div className="flex items-center gap-4"><div className="w-16 h-16 rounded-2xl flex items-center justify-center bg-cyan-50 text-[#00BBF9]"><Speaker size={32} /></div><h3 className="text-2xl font-black text-[#2D3142]">Materi: {customSoundTheme || selectedSoundTheme.name}</h3></div><button onClick={() => setSoundStep('setup')} className="px-6 py-3 bg-gray-100 text-gray-500 rounded-2xl font-bold hover:bg-gray-200">Ganti Tema</button></div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8 pb-20">{soundItems.map((item, idx) => (<button key={idx} onClick={() => { if (item.imageUrl) { setSelectedSoundItem(item); setCurrentStoryIdx(idx); setModalImage(item.imageUrl); setModalType('sound'); setShowModal(true); } }} disabled={!item.imageUrl} className={`group relative aspect-[3/4] rounded-[3.5rem] p-4 shadow-xl transition-all flex flex-col border-4 border-white bg-white ${!item.imageUrl ? 'opacity-50' : 'hover:-translate-y-2'}`}><div className="flex-1 flex items-center justify-center w-full">{item.imageUrl ? (<img src={item.imageUrl} className="w-full h-full object-cover rounded-[2.5rem] transform group-hover:scale-110 transition-transform" alt={item.name} />) : (<Loader2 className="animate-spin text-gray-300" size={60} />)}</div><div className="text-center w-full bg-cyan-50 rounded-3xl py-4 mt-4 uppercase"><span className="text-xl font-black block text-[#00BBF9] tracking-wider">{item.imageUrl ? item.name : '...'}</span></div></button>))}</div>
           </div>
         )}
       </div>
@@ -793,56 +756,66 @@ const App = () => {
       {showModal && (
         <div className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-md flex items-center justify-center p-4">
           <div className="relative w-full max-w-5xl bg-white p-4 rounded-[2.5rem] shadow-2xl animate-in zoom-in duration-300">
-            <button onClick={() => setShowModal(false)} className="absolute -top-4 -right-4 bg-white text-slate-800 p-3 rounded-full shadow-2xl hover:bg-red-50 transition-colors border-2 border-slate-100 z-[110]"><X size={28} strokeWidth={3} /></button>
+            <button onClick={() => { setShowModal(false); stopCurrentAudio(); }} className="absolute -top-4 -right-4 bg-white text-slate-800 p-3 rounded-full shadow-2xl hover:bg-red-50 transition-colors border-2 border-slate-100 z-[110]"><X size={28} strokeWidth={3} /></button>
             <div className={`rounded-[2rem] overflow-hidden shadow-inner bg-slate-50 relative flex items-center justify-center ${
                 (modalType === 'job' || modalType === 'learn' || modalType === 'sound') ? 'aspect-[3/4] max-h-[80vh] mx-auto' : 
                 (modalType === 'printable') ? 'aspect-[1.414/1] max-h-[65vh] mx-auto' : 
                 'aspect-video max-h-[80vh]'
             }`}>
-              <img src={modalImage} className={`w-full h-full ${(modalType === 'job' || modalType === 'printable' || modalType === 'learn' || modalType === 'sound' || modalType === 'story' || modalType === 'sketch') ? 'object-cover' : 'object-contain'}`} alt="Fullscreen" />
+              <img src={modalImage} className={`w-full h-full ${modalType === 'job' ? 'object-cover' : 'object-contain'}`} alt="Fullscreen" />
               {(modalType === 'learn' || modalType === 'sound' || modalType === 'story' || modalType === 'job') && (
                 <>
                   {currentStoryIdx > 0 && (<button onClick={() => { 
                     const n = currentStoryIdx - 1; 
-                    setCurrentStoryIdx(n); 
                     const items = modalType === 'learn' ? learnItems : modalType === 'sound' ? soundItems : modalType === 'job' ? jobResults : storyPages;
-                    setModalImage(modalType === 'story' ? items[n].image : (modalType === 'job' ? items[n] : items[n].imageUrl)); 
-                    if(modalType === 'learn') setSelectedLetterItem(items[n]); 
-                    else if(modalType === 'sound') setSelectedSoundItem(items[n]); 
-                  }} className={`absolute left-6 top-1/2 -translate-y-1/2 bg-white/80 p-4 rounded-full shadow-xl hover:bg-white transition-all ${modalType === 'story' ? 'text-[#1982C4]' : (modalType === 'job' ? 'text-[#FF595E]' : (modalType === 'learn' ? 'text-[#9B5DE5]' : 'text-[#00BBF9]'))}`}><ChevronLeft size={32} strokeWidth={3} /></button>)}
+                    if (items[n]) {
+                      setCurrentStoryIdx(n); 
+                      setModalImage(modalType === 'story' ? items[n].image : (modalType === 'job' ? items[n] : items[n].imageUrl)); 
+                      if(modalType === 'learn') setSelectedLetterItem(items[n]); 
+                      else if(modalType === 'sound') setSelectedSoundItem(items[n]); 
+                    }
+                    stopCurrentAudio();
+                  }} className="absolute left-6 top-1/2 -translate-y-1/2 bg-white/80 p-4 rounded-full shadow-xl hover:bg-white text-slate-800"><ChevronLeft size={32} strokeWidth={3} /></button>)}
                   {currentStoryIdx < (modalType === 'learn' ? learnItems.length : (modalType === 'sound' ? soundItems.length : (modalType === 'job' ? jobResults.length : storyPages.length))) - 1 && (<button onClick={() => { 
                     const n = currentStoryIdx + 1; 
-                    setCurrentStoryIdx(n); 
                     const items = modalType === 'learn' ? learnItems : modalType === 'sound' ? soundItems : modalType === 'job' ? jobResults : storyPages;
-                    setModalImage(modalType === 'story' ? items[n].image : (modalType === 'job' ? items[n] : items[n].imageUrl)); 
-                    if(modalType === 'learn') setSelectedLetterItem(items[n]); 
-                    else if(modalType === 'sound') setSelectedSoundItem(items[n]); 
-                  }} className={`absolute right-6 top-1/2 -translate-y-1/2 bg-white/80 p-4 rounded-full shadow-xl hover:bg-white transition-all ${modalType === 'story' ? 'text-[#1982C4]' : (modalType === 'job' ? 'text-[#FF595E]' : (modalType === 'learn' ? 'text-[#9B5DE5]' : 'text-[#00BBF9]'))}`}><ChevronRight size={32} strokeWidth={3} /></button>)}
+                    if (items[n]) {
+                      setCurrentStoryIdx(n); 
+                      setModalImage(modalType === 'story' ? items[n].image : (modalType === 'job' ? items[n] : items[n].imageUrl)); 
+                      if(modalType === 'learn') setSelectedLetterItem(items[n]); 
+                      else if(modalType === 'sound') setSelectedSoundItem(items[n]); 
+                    }
+                    stopCurrentAudio();
+                  }} className="absolute right-6 top-1/2 -translate-y-1/2 bg-white/80 p-4 rounded-full shadow-xl hover:bg-white text-slate-800"><ChevronRight size={32} strokeWidth={3} /></button>)}
                 </>
-              )}
-              {modalType === 'learn' && selectedLetterItem && (
-                 <div className="absolute top-6 left-6 bg-white/90 backdrop-blur-md p-4 rounded-3xl shadow-xl flex items-center gap-4"><span className="text-6xl font-black text-[#9B5DE5]">{selectedLetterItem.char}</span><div className="h-10 w-[2px] bg-purple-100" /><span className="text-2xl font-black text-slate-700 uppercase tracking-widest">{selectedLetterItem.word}</span></div>
-              )}
-              {modalType === 'sound' && selectedSoundItem && (
-                 <div className="absolute top-6 left-6 bg-white/90 backdrop-blur-md p-4 rounded-3xl shadow-xl flex items-center gap-4"><Volume2 className="text-[#00BBF9]" size={40} /><div className="h-10 w-[2px] bg-cyan-100" /><span className="text-2xl font-black text-slate-700 uppercase tracking-widest">{selectedSoundItem.name}</span></div>
               )}
             </div>
             <div className="mt-6 flex justify-between items-center px-4">
-              <div className="flex items-center gap-2"><Heart className="text-red-500 fill-red-500" /><span className="text-xl font-black text-slate-800">
+              <div className="flex items-center gap-2"><Heart className="text-red-500 fill-red-500" /><span className="text-xl font-black text-slate-800 uppercase tracking-wide">
                 {modalType === 'story' ? `Buku Ceritaku - Hal ${currentStoryIdx + 1}` : 
-                 modalType === 'printable' ? 'Sketsa Mewarnai A4 Landscape' : 
-                 modalType === 'learn' ? `${learnLanguage === 'id' ? 'Kartu' : 'Flashcard'} ${selectedLetterItem?.word}` : 
+                 modalType === 'printable' ? 'Sketsa Mewarnai A4' : 
+                 modalType === 'learn' ? `Flashcard ${selectedLetterItem?.word}` : 
                  modalType === 'sound' ? `Suara ${selectedSoundItem?.name}` : 
-                 modalType === 'job' ? `Prediksi Cita-cita - Variasi ${currentStoryIdx + 1}` :
-                 modalType === 'sketch' ? 'Narasi Gambar Ajaib' :
-                 'Karya Ajaib KidsZone'}
+                 modalType === 'job' ? `Prediksi - Variasi ${currentStoryIdx + 1}` :
+                 'KidsZone Lab'}
               </span></div>
               <div className="flex gap-4">
                 {(modalType === 'learn' || modalType === 'sound' || modalType === 'story' || (modalType === 'sketch' && sketchNarration)) && (
-                  <button onClick={() => { if(modalType === 'learn') generateTTS(`${selectedLetterItem.char} ${learnLanguage === 'id' ? 'untuk' : 'is for'} ${selectedLetterItem.word}`, learnLanguage); else if(modalType === 'sound') generateSoundTTS(selectedSoundItem); else if(modalType === 'sketch') generateTTS(sketchNarration, 'id'); else generateTTS(storyPages[currentStoryIdx].text, storyLanguage); }} disabled={isSpeaking} className={`text-white px-8 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg transition-all disabled:opacity-50 ${modalType === 'story' ? 'bg-[#1982C4]' : modalType === 'learn' ? 'bg-[#9B5DE5]' : modalType === 'sketch' ? 'bg-amber-500' : 'bg-[#00BBF9]'}`}><Volume2 size={24} className={isSpeaking ? 'animate-bounce' : ''} /> {modalType === 'story' || modalType === 'sketch' ? 'Dengar Narasi' : 'Dengar Suara'}</button>
+                  <button 
+                    onClick={() => { 
+                      const key = modalType === 'sketch' ? 'magic_sketch' : (modalType === 'learn' ? `learn_${currentStoryIdx}` : (modalType === 'sound' ? `sound_${currentStoryIdx}` : `story_${currentStoryIdx}`));
+                      const text = modalType === 'sketch' ? sketchNarration : (modalType === 'learn' ? `${selectedLetterItem?.char} untuk ${selectedLetterItem?.word}` : (modalType === 'sound' ? `${selectedSoundItem?.onomatopoeia}, suara ${selectedSoundItem?.name}` : storyPages[currentStoryIdx]?.text));
+                      const lang = modalType === 'story' ? storyLanguage : (modalType === 'learn' ? learnLanguage : 'id');
+                      playAudio(text, key, lang);
+                    }} 
+                    className={`text-white px-8 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg transition-all ${isSpeaking ? 'bg-red-500' : 'bg-[#1982C4]'}`}
+                  >
+                    {isSpeaking ? <Square size={24} /> : <Volume2 size={24} />} 
+                    {isSpeaking ? 'Stop' : 'Dengar'}
+                  </button>
                 )}
-                <button onClick={() => setShowModal(false)} className="bg-slate-100 text-slate-500 px-8 py-3 rounded-2xl font-bold">Tutup</button>
-                <button onClick={() => { if (modalType === 'job') download34Portrait(modalImage, "CitaCita", currentStoryIdx); else if (modalType === 'printable') downloadA4Printable(modalImage); else if (modalType === 'learn') download34Portrait(modalImage, `Belajar_${selectedLetterItem?.char}_${selectedLetterItem?.word}`, 0); else if (modalType === 'sound') download34Portrait(modalImage, `Suara_${selectedSoundItem?.name}`, 0); else if (modalType === 'story') handleDownloadSimple(modalImage, `Cerita_Halaman_${currentStoryIdx + 1}.png`); else if (modalType === 'sketch') downloadMagicResultWithSnapshot(modalImage, originalSketch); else handleDownloadSimple(modalImage, 'KidsZoneArtwork.png'); }} className="bg-green-500 text-white px-8 py-3 rounded-2xl font-black flex items-center gap-2 shadow-lg hover:bg-green-600 transition-colors"><Download size={20} /> Simpan</button>
+                <button onClick={() => { setShowModal(false); stopCurrentAudio(); }} className="bg-slate-100 text-slate-500 px-8 py-3 rounded-2xl font-bold">Tutup</button>
+                <button onClick={() => { if (modalType === 'job') download34Portrait(modalImage, "CitaCita", currentStoryIdx); else if (modalType === 'printable') downloadA4Printable(modalImage); else if (modalType === 'learn') download34Portrait(modalImage, `Flashcard_${selectedLetterItem?.word}`, 0); else if (modalType === 'sound') download34Portrait(modalImage, `Suara_${selectedSoundItem?.name}`, 0); else if (modalType === 'story') handleDownloadSimple(modalImage, `Cerita_Hal_${currentStoryIdx + 1}.png`); else if (modalType === 'sketch') downloadMagicResultWithSnapshot(modalImage, canvasRef.current?.toDataURL()); }} className="bg-[#8AC926] text-white px-8 py-3 rounded-2xl font-black flex items-center gap-2 shadow-lg hover:brightness-95"><Download size={20} /> Simpan</button>
               </div>
             </div>
           </div>
