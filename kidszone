@@ -690,6 +690,120 @@ const App = () => {
     </div>
   );
 
+  const renderPrintableSketch = () => (
+    <div className="min-h-screen bg-[#FFFBEB] font-['Fredoka_One',_cursive] pb-20">
+      <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center gap-4">
+          <button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors">
+            <ChevronLeft size={28} className="text-gray-400" />
+          </button>
+          <h1 className="text-2xl font-black text-[#FFCA3A]">Printable Sketch</h1>
+        </div>
+        <div className="w-10 h-10 bg-[#FFCA3A] rounded-xl flex items-center justify-center shadow-lg">
+          <Printer className="text-white w-6 h-6" />
+        </div>
+      </header>
+      
+      <div className="max-w-6xl mx-auto p-6 md:p-10 space-y-12">
+        <section className="bg-white rounded-[3rem] p-8 shadow-xl border-4 border-white text-center">
+          <h2 className="text-3xl font-black text-[#2D3142] mb-8">Pilih Gambar Mewarnai 🖍️</h2>
+          
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+            {PRINTABLE_CATEGORIES.map(cat => (
+              <button 
+                key={cat.id} 
+                onClick={() => {
+                  setPrintableCategory(cat);
+                  setPrintableSubject(cat.items[0].name);
+                  setCustomPrintable("");
+                }}
+                className={`p-6 rounded-3xl border-4 flex flex-col items-center gap-3 transition-all ${printableCategory.id === cat.id ? 'border-[#FFCA3A] bg-yellow-50 scale-105 shadow-md' : 'border-gray-50 hover:border-gray-200'}`}
+              >
+                <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${cat.bg} ${cat.color}`}>
+                  {cat.icon}
+                </div>
+                <span className="font-bold">{cat.name}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="bg-gray-50 p-6 rounded-[2.5rem] mb-8">
+             <div className="flex flex-wrap justify-center gap-3 mb-6">
+                {printableCategory.items.map(item => (
+                  <button 
+                    key={item.name}
+                    onClick={() => {
+                      setPrintableSubject(item.name);
+                      setCustomPrintable("");
+                    }}
+                    className={`px-6 py-3 rounded-2xl font-bold transition-all flex items-center gap-2 ${printableSubject === item.name && !customPrintable ? 'bg-[#FFCA3A] text-white shadow-lg' : 'bg-white text-gray-400 border-2 border-gray-100'}`}
+                  >
+                    <span>{item.icon}</span>
+                    <span>{item.name}</span>
+                  </button>
+                ))}
+             </div>
+             
+             <div className="relative max-w-md mx-auto">
+                <input 
+                  type="text" 
+                  placeholder="Atau ketik sendiri (misal: Robot Keren)..." 
+                  value={customPrintable}
+                  onChange={(e) => setCustomPrintable(e.target.value)}
+                  className="w-full px-6 py-4 bg-white border-4 border-yellow-50 rounded-2xl outline-none font-bold focus:border-[#FFCA3A] transition-all"
+                />
+             </div>
+          </div>
+
+          <button 
+            onClick={generatePrintableSketches}
+            disabled={isProcessingPrintable}
+            className={`px-16 py-6 bg-[#FFCA3A] text-white rounded-[2rem] font-black text-2xl shadow-xl flex items-center gap-3 mx-auto transition-all ${isProcessingPrintable ? 'opacity-70 scale-95' : 'hover:scale-105 active:scale-95'}`}
+          >
+            {isProcessingPrintable ? <Loader2 className="animate-spin" size={32} /> : <Sparkles size={32} />}
+            {isProcessingPrintable ? 'MENYIAPKAN...' : 'BUAT SKETSA!'}
+          </button>
+        </section>
+
+        {isProcessingPrintable && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-8 animate-pulse">
+            {[1,2,3,4].map(i => (
+              <div key={i} className="bg-white p-4 rounded-[3rem] shadow-xl border-4 border-white">
+                <div className="aspect-video rounded-[2.2rem] bg-gray-100 flex items-center justify-center">
+                  <ImageIcon size={48} className="text-gray-200" />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {printableResults.length > 0 && !isProcessingPrintable && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-8 animate-in zoom-in">
+            {printableResults.map((img, idx) => (
+              <div key={idx} className="bg-white p-4 rounded-[3rem] shadow-xl border-4 border-white group cursor-pointer" onClick={() => { setModalImage(img); setModalType('printable'); setShowModal(true); }}>
+                <div className="aspect-video rounded-[2.2rem] overflow-hidden border-2 border-gray-50 relative">
+                  <img src={img} className="w-full h-full object-cover group-hover:scale-105 transition-transform" alt="Coloring Page" />
+                  <div className="absolute inset-0 bg-black/5 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                    <Maximize2 size={40} className="text-white drop-shadow-md" />
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-between items-center px-4">
+                  <span className="text-[#FFCA3A] font-black uppercase text-sm tracking-widest">Sketsa {idx + 1}</span>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); downloadA4Printable(img, idx); }}
+                    className="p-3 bg-yellow-50 text-[#FFCA3A] rounded-2xl hover:bg-[#FFCA3A] hover:text-white transition-all shadow-sm"
+                  >
+                    <Download size={20} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
   const renderLearnTheThing = () => (
     <div className="min-h-screen bg-[#F5F3FF] font-['Fredoka_One',_cursive] pb-20">
       <header className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-50"><div className="flex items-center gap-4"><button onClick={() => setView('menu')} className="p-2 hover:bg-gray-100 rounded-full transition-colors"><ChevronLeft size={28} className="text-gray-400" /></button><h1 className="text-2xl font-black text-[#9B5DE5]">Learn The Thing</h1></div><div className="w-10 h-10 bg-[#9B5DE5] rounded-xl flex items-center justify-center shadow-lg"><Type className="text-white w-6 h-6" /></div></header>
