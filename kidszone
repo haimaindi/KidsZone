@@ -51,14 +51,14 @@ const PRESETS_SKETCH = [
   { 
     id: '3d cartoon', 
     name: 'Animasi', 
-    icon: '🎨', 
-    prompt: 'vibrant 3D Disney-style or Pixar-Style cute animation illustration' 
+    icon: '🎠', 
+    prompt: 'vibrant color 3D Disney-style or Pixar-Style cute animation illustration.' 
   },
   { 
     id: 'realism', 
     name: 'Dunia Nyata', 
     icon: '📸', 
-    prompt: 'ultrarealistic, highly detailed photographic professional style' 
+    prompt: 'Highly detailed ultrarealistic photographic professional style' 
   },
   { 
     id: 'anime', 
@@ -727,7 +727,7 @@ const App = () => {
   const handleStartSketchMagic = async () => {
     setIsProcessingSketch(true); setSketchResult(null); setSketchNarration(""); setError(null);
     try {
-      constrobustPrompt = robustPrompt = `Advanced Artistic Transformation. Realize it as a ${selectedSketchPreset.prompt}. HIGH FIDELITY integrity of the user's core strokes.`;
+      constrobustPrompt = robustPrompt = `FIRST OF ALL: ANALYZE AND IMAGINE what user want to sketch or draw in canvas.Transform to Advanced Artistic Transformation and MUST USE EVERY STROKE, DOODLE, SCRIBBLE AS GUIDELINE. Realize it as a ${selectedSketchPreset.prompt}. HIGH FIDELITY integrity of the user's core strokes. MANDATORY: REMOVE all strokes, doodles, scribbles or sketch from the FINAL GENERATED IMAGE`;
       const transData = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: robustPrompt }, { inlineData: { mimeType: "image/png", data: canvasRef.current.toDataURL().split(',')[1] } }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } })
@@ -939,7 +939,7 @@ const App = () => {
           <div className="relative w-full max-w-5xl bg-white p-4 rounded-[2.5rem] shadow-2xl animate-in zoom-in duration-300">
             <button onClick={() => { setShowModal(false); stopCurrentAudio(); }} className="absolute -top-4 -right-4 bg-white text-slate-800 p-3 rounded-full shadow-2xl hover:bg-red-50 transition-colors border-2 border-slate-100 z-[110]"><X size={28} strokeWidth={3} /></button>
             <div className={`rounded-[2rem] overflow-hidden shadow-inner bg-slate-50 relative flex items-center justify-center ${(modalType === 'job' || modalType === 'learn' || modalType === 'sound') ? 'aspect-[3/4] max-h-[80vh] mx-auto' : (modalType === 'printable') ? 'aspect-[1.414/1] max-h-[65vh] mx-auto' : 'aspect-video max-h-[80vh]'}`}>
-              <img src={modalImage} className={`w-full h-full ${modalType === 'job' || modalType === 'learn' || modalType === 'sound' ? 'object-contain' : 'object-contain'}`} alt="Fullscreen" />
+              <img src={modalImage} className={`w-full h-full ${modalType === 'job' || modalType === 'learn' || modalType === 'sound' ? 'object-cover' : 'object-contain'}`} alt="Fullscreen" />
               {(modalType === 'learn' || modalType === 'sound' || modalType === 'story' || modalType === 'job') && (
                 <>
                   {currentStoryIdx > 0 && (<button onClick={() => { const n = currentStoryIdx - 1; const items = modalType === 'learn' ? learnItems : modalType === 'sound' ? soundItems : modalType === 'job' ? jobResults : storyPages; if (items[n]) { setCurrentStoryIdx(n); setModalImage(modalType === 'story' ? items[n].image : (modalType === 'job' ? items[n] : items[n].imageUrl)); if(modalType === 'learn') setSelectedLetterItem(items[n]); else if(modalType === 'sound') setSelectedSoundItem(items[n]); } stopCurrentAudio(); }} className="absolute left-6 top-1/2 -translate-y-1/2 bg-white/80 p-4 rounded-full shadow-xl hover:bg-white text-slate-800"><ChevronLeft size={32} strokeWidth={3} /></button>)}
